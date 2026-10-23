@@ -1,7 +1,8 @@
 # QEMU/KVM virtual machines on Arch Linux
 
 `qemu-vm.sh` installs the host tools and creates persistent libvirt guests from
-local installation ISOs. Run it from Bash or invoke the executable from Zsh.
+local ISOs, HTTPS URLs, or the newest official Arch installation ISO. Run it
+from Bash or invoke the executable from Zsh.
 The host must run x86-64 Arch Linux with AMD-V or Intel VT-x available.
 
 Every command that changes state previews its operation until `--execute` is
@@ -16,7 +17,7 @@ commands. An ordinary account needs sudo privileges. Setup installs Python and
 the remaining tools through their package dependencies.
 
 ```bash
-cd ~/qemu-vm
+cd ~/my_repos/qemu-vm
 ./qemu-vm.sh --help
 
 # Preview packages, daemon configuration, and the default NAT network.
@@ -31,7 +32,7 @@ The package transaction is:
 ```bash
 sudo pacman -Syu --needed -- \
   qemu-desktop libvirt virt-install virt-viewer edk2-ovmf \
-  virt-firmware swtpm dnsmasq nftables virt-manager
+  virt-firmware swtpm dnsmasq nftables curl ca-certificates virt-manager
 ```
 
 `virt-manager` is included only with `--with-manager`. `--needed` avoids
@@ -48,8 +49,68 @@ the packaged network only when absent and enables its startup. This follows
 
 The script loads `kvm_amd` or `kvm_intel` if `/dev/kvm` is absent. A kernel
 without KVM support or disabled firmware virtualization produces a clear error.
-A host
-kernel upgrade may require a reboot before modules match the running kernel.
+A host kernel upgrade may require a reboot before modules match the running
+kernel.
+
+## Fetch the newest Arch ISO automatically
+
+Use `--arch-latest` to resolve the current official release when you apply the
+command. This preview makes no network requests:
+
+```bash
+./qemu-vm.sh create --name ArchLatest --arch-latest \
+  --memory 4096 --vcpus 4 --disk-size 80 --no-start
+```
+
+Add `--execute` to download the ISO and create the powered-off guest. The
+`archlinux` OS variant and ISO-first boot are selected automatically. You can
+configure the host and create the guest in one invocation:
+
+```bash
+./qemu-vm.sh create --setup --with-manager --name ArchPrepared \
+  --arch-latest --no-start --execute
+```
+
+The script reads [Arch's official release metadata][arch-releases], selects its
+latest available release, and fetches that release's dated x86-64 ISO from
+`geo.mirror.pkgbuild.com`. It checks the ISO against the SHA-256 published in
+that metadata before attaching it. Pinning the dated URL keeps the checksum
+and image on the same release if a new ISO appears during the download.
+
+This verifies integrity against metadata retrieved over HTTPS. Detached PGP
+signature verification is a separate process described on the
+[official Arch download page][arch-download].
+
+[arch-releases]: https://archlinux.org/releng/releases/json/
+[arch-download]: https://archlinux.org/download/
+
+## Use an installer URL
+
+Use `--iso-url` for another distribution or a vendor-provided download link.
+Replace the example URL with a direct installer download:
+
+```bash
+./qemu-vm.sh create --name DownloadedLab \
+  --iso-url 'https://example.org/installer.iso' --no-start
+```
+
+`--iso 'https://example.org/installer.iso'` is an equivalent shortcut. Quote
+URLs containing query parameters such as `?` or `&`. A URL can point to a
+download endpoint without an `.iso` suffix. The source must use HTTPS, and
+redirects must also remain on HTTPS. URL credentials and fragments are rejected.
+
+Supply `--iso-sha256 HEX` to verify a publisher-provided 64-character SHA-256
+checksum. This also works with local `--iso` files. Arbitrary URL downloads
+without that option are checked for transfer errors and nonempty content;
+they have no publisher checksum check. `--arch-latest` always uses its official
+checksum and cannot be combined with `--iso-sha256`.
+
+Choose one installation source: local `--iso`, a URL, or `--arch-latest`.
+Each remote ISO downloads to the new VM directory as `install.iso.part` and is
+renamed to `install.iso` after its checks pass. A failed transfer or checksum
+keeps the partial file for inspection and stops before disk creation or VM
+registration. `curl` retries transient download errors; rerunning `create`
+still refuses an existing VM directory.
 
 ## Create an Arch Linux guest
 
@@ -126,6 +187,37 @@ For VirtIO storage and networking, obtain a trusted VirtIO driver ISO, then use:
 Load the appropriate Windows storage driver from the second CD-ROM during
 installation, then install its networking and other guest drivers.
 
+## More creation examples
+
+These examples also appear in `./qemu-vm.sh --help`. They preview their
+operations; add `--execute` to apply one. Each uses a different VM name.
+
+Four vCPUs with a 50% aggregate CPU budget allow about two logical CPUs' worth
+of total VM CPU time. This guest starts with 4 GiB RAM and an 8 GiB balloon
+ceiling, which requires guest support and manual management:
+
+```bash
+./qemu-vm.sh create --name LimitedLab --arch-latest \
+  --vcpus 4 --cpu-limit 50 --memory 4096 --memory-max 8192
+```
+
+Create an offline guest with 2 GiB RAM, a 32 GiB disk, and no network interface:
+
+```bash
+./qemu-vm.sh create --name OfflineLab --arch-latest \
+  --network none --memory 2048 --disk-size 32 --no-start
+```
+
+The host still needs internet access to fetch the ISO for this offline guest.
+Use a local `--iso` instead if the host is also offline.
+
+Attach a guest to an existing Linux bridge named `br0`. Configure the host
+bridge before using this example:
+
+```bash
+./qemu-vm.sh create --name BridgedLab --arch-latest --network bridge=br0
+```
+
 ## Main parameters and Hyper-V equivalents
 
 RAM is in MiB; disk capacity is in GiB. Each VM has a new sparse qcow2 disk.
@@ -134,6 +226,9 @@ RAM is in MiB; disk capacity is in GiB. Each VM has a new sparse qcow2 disk.
 | --- | --- |
 | VM name | `--name NAME` |
 | Installation ISO | `--iso PATH` |
+| Download an installer | `--iso-url HTTPS_URL` or `--iso HTTPS_URL` |
+| Newest official Arch installer | `--arch-latest`; automatic SHA-256 check |
+| Expected installer checksum | `--iso-sha256 HEX` |
 | Additional driver media | `--driver-iso PATH` |
 | Processor count | `--vcpus N`; one socket with N cores |
 | CPU model | `--cpu host-passthrough` or `host-model` |
@@ -208,12 +303,13 @@ The default guest files are:
 /var/lib/libvirt/images/ArchLab/
   disk.qcow2                 New sparse guest disk
   install.iso                Copy of the requested installer, when supplied
+  arch-release.json          Official release metadata with --arch-latest
   drivers.iso                Optional driver media copy
   secure-vars-template.fd    Secure Boot template, when enabled
   domain.xml                 Initial definition for inspection
 ```
 
-The ISO copies use reflinks when the filesystems support them; otherwise they
+Local ISO copies use reflinks when the filesystems support them; otherwise they
 use ordinary copies. Copies are compared with their sources before the guest
 is defined. Full comparisons read the ISO data. Staging media here lets QEMU
 read it without changing permissions on private home directories.
@@ -279,12 +375,16 @@ package, service, and firmware tools. It also creates and checks a real sparse
 qcow2 image in a temporary directory. Run it with:
 
 ```bash
-cd ~/qemu-vm
+cd ~/my_repos/qemu-vm
 python3 -m unittest discover -s tests -v
 bash -n qemu-vm.sh
 shellcheck qemu-vm.sh
 shfmt -d -i 2 -ci qemu-vm.sh
 ```
+
+Download tests use simulated HTTPS responses, release metadata, transfer
+failures, and checksum mismatches. Small official release metadata can be
+checked separately without fetching the full ISO.
 
 `qemu-img` enables the disposable disk tests. Live dependency installation,
 libvirt/network activation, Secure Boot execution, and guest installation were

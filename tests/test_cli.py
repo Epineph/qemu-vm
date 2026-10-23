@@ -1,10 +1,12 @@
-"""Offline CLI/safety checks. Libvirt and firmware tooling are simulated.
+#!/usr/bin/env python3
+"""Offline CLI/safety checks. Libvirt, downloads and firmware are simulated.
 
 Run: python3 -m unittest discover -s tests -v
 The real qemu-img checks a disposable sparse qcow2 image when available.
 No sudo authentication, package installation, services, or real VMs are used.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -17,6 +19,15 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'qemu-vm.sh'
 REAL_QEMU_IMG = shutil.which('qemu-img')
+DOWNLOAD_BYTES = b'fixture downloaded installation ISO\n'
+DOWNLOAD_SHA256 = hashlib.sha256(DOWNLOAD_BYTES).hexdigest()
+ARCH_VERSION = '2026.10.01'
+ARCH_RELEASES_URL = 'https://archlinux.org/releng/releases/json/'
+ARCH_ISO_URL = (
+  f'https://geo.mirror.pkgbuild.com/iso/{ARCH_VERSION}/'
+  f'archlinux-{ARCH_VERSION}-x86_64.iso'
+)
+INSTALLER_URL = 'https://example.invalid/installer.iso?download=1&edition=lab'
 RUNNER = r'''
 source "$1"
 shift
@@ -26,6 +37,7 @@ main "$@"
 '''
 
 DISPATCHER = r'''#!/usr/bin/env python3
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -62,6 +74,64 @@ elif tool == 'qemu-img':
   os.execv(os.environ['QVM_REAL_QEMU_IMG'], ['qemu-img', *args])
 elif tool == 'pacman':
   pass
+elif tool == 'curl':
+  destination = Path(argument('--output'))
+  url = args[-1]
+  metadata = url == 'https://archlinux.org/releng/releases/json/'
+  kind = 'metadata' if metadata else 'iso'
+  content = b'fixture downloaded installation ISO\n'
+  if os.environ.get('QVM_CURL_FAIL') == kind:
+    destination.write_bytes(b'partial transfer\n')
+    print('Simulated curl transfer failure', file=sys.stderr)
+    raise SystemExit(22)
+  if os.environ.get('QVM_CURL_EMPTY') == kind:
+    destination.write_bytes(b'')
+  elif metadata:
+    version = '2026.10.01'
+    prefix = '/iso/'
+    release = {
+      'version': version,
+      'available': True,
+      'release_date': '2026-10-01',
+      'iso_url': prefix + version + '/archlinux-' + version + '-x86_64.iso',
+      'sha256_sum': hashlib.sha256(content).hexdigest(),
+    }
+    # The latest entry is deliberately not first: select latest_version's entry.
+    older = dict(release, version='2026.09.01', sha256_sum='0' * 64,
+                 iso_url=prefix + '2026.09.01/archlinux-2026.09.01-x86_64.iso')
+    payload = {'version': 1, 'latest_version': version,
+               'releases': [older, release]}
+    invalid = os.environ.get('QVM_ARCH_BAD_METADATA', '')
+    if invalid == 'wrong-schema':
+      payload['version'] = 2
+    elif invalid == 'missing-latest':
+      del payload['latest_version']
+    elif invalid == 'missing-release':
+      payload['latest_version'] = '2026.10.02'
+    elif invalid == 'unavailable':
+      release['available'] = False
+    elif invalid == 'availability-string':
+      release['available'] = 'true'
+    elif invalid == 'duplicate-release':
+      payload['releases'].append(dict(release))
+    elif invalid == 'bad-version':
+      payload['latest_version'] = 'latest'
+      release['version'] = 'latest'
+      release['iso_url'] = prefix + 'latest/archlinux-latest-x86_64.iso'
+    elif invalid == 'bad-hash':
+      release['sha256_sum'] = 'z' * 64
+    elif invalid == 'missing-hash':
+      del release['sha256_sum']
+    elif invalid == 'bad-url':
+      release['iso_url'] = older['iso_url']
+    elif invalid == 'insecure-url':
+      release['iso_url'] = 'http://geo.mirror.pkgbuild.com' + release['iso_url']
+    destination.write_text('{invalid' if invalid == 'invalid-json'
+                           else json.dumps(payload))
+  else:
+    if os.environ.get('QVM_ISO_BAD_HASH'):
+      content += b'corrupted transfer\n'
+    destination.write_bytes(content)
 elif tool == 'systemctl':
   if args[0] in ('is-active', 'is-enabled'):
     configured = os.environ.get('QVM_' + args[0].upper().replace('-', '_'), '')
@@ -162,7 +232,7 @@ class CliSafetyTests(unittest.TestCase):
     dispatcher = self.bin / 'dispatcher.py'
     dispatcher.write_text(DISPATCHER)
     dispatcher.chmod(0o755)
-    for tool in ('sudo', 'pacman', 'systemctl', 'virsh', 'virt-install',
+    for tool in ('sudo', 'pacman', 'curl', 'systemctl', 'virsh', 'virt-install',
                  'virt-fw-vars', 'qemu-img'):
       (self.bin / tool).symlink_to(dispatcher)
     self.env = dict(os.environ)
@@ -195,6 +265,31 @@ class CliSafetyTests(unittest.TestCase):
                ] if self.log.exists() else []
     return [record for record in records if tool in (None, record['tool'])]
 
+  def create_download(self, *arguments, **environment):
+    if not REAL_QEMU_IMG:
+      self.skipTest('qemu-img is required for disposable disk checks')
+    return self.run_cli(
+      'create', '--name', 'LabVM', '--storage-dir', self.storage,
+      *arguments, **environment,
+    )
+
+  def assert_no_disk_or_definition(self):
+    self.assertEqual(self.commands('qemu-img'), [])
+    self.assertEqual(list(self.storage.rglob('disk.qcow2')), [])
+    self.assertEqual(list(self.state.glob('*.xml')), [])
+    actions = [r['args'][2] for r in self.commands('virsh')]
+    self.assertNotIn('define', actions)
+    self.assertNotIn('start', actions)
+
+  def assert_https_download(self, record, expected_url):
+    arguments = record['args']
+    self.assertEqual(arguments[0], '-q')
+    for flag in ('--globoff', '--fail', '--location', '--output'):
+      self.assertIn(flag, arguments)
+    self.assertEqual(arguments[arguments.index('--proto') + 1], '=https')
+    self.assertEqual(arguments[arguments.index('--proto-redir') + 1], '=https')
+    self.assertEqual(arguments[-2:], ['--', expected_url])
+
   def assert_success(self, result):
     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -221,6 +316,184 @@ class CliSafetyTests(unittest.TestCase):
     self.assertIn('Plan for LabVM', result.stdout)
     self.assertEqual(self.commands(), [])
     self.assertFalse(self.storage.exists())
+
+  def test_url_preview_never_downloads_or_uses_privileged_tools(self):
+    result = self.create_download('--iso-url', INSTALLER_URL, '--setup')
+    self.assert_success(result)
+    self.assertEqual(self.commands(), [])
+    self.assertFalse(self.storage.exists())
+
+  def test_latest_arch_preview_never_fetches_release_metadata(self):
+    result = self.create_download('--arch-latest', '--setup')
+    self.assert_success(result)
+    self.assertEqual(self.commands(), [])
+    self.assertFalse(self.storage.exists())
+
+  def test_url_and_checksum_argument_conflicts_fail_before_privileged_work(self):
+    cases = [
+      ('--arch-latest', '--iso', self.iso),
+      ('--arch-latest', '--iso-url', INSTALLER_URL),
+      ('--iso', self.iso, '--iso-url', INSTALLER_URL),
+      ('--arch-latest', '--iso-sha256', DOWNLOAD_SHA256),
+      ('--arch-latest', '--guest', 'windows'),
+      ('--iso-url', 'http://example.invalid/installer.iso'),
+      ('--iso', 'http://example.invalid/installer.iso'),
+      ('--iso-url', 'file:///tmp/installer.iso'),
+      ('--iso-url', 'https://'),
+      ('--iso-url', 'https://example.invalid/unsafe\ninstaller.iso'),
+      ('--iso-url', INSTALLER_URL, '--iso-sha256', 'z' * 64),
+      ('--iso-url', INSTALLER_URL, '--iso-sha256', 'a' * 63),
+      ('--iso-url', INSTALLER_URL, '--iso-sha256'),
+      ('--iso-sha256', DOWNLOAD_SHA256),
+    ]
+    for arguments in cases:
+      with self.subTest(arguments=arguments):
+        result = self.create_download(*arguments, '--execute')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertEqual(self.commands(), [])
+    self.assertFalse(self.storage.exists())
+
+  def test_url_download_stages_verified_bytes_before_definition(self):
+    result = self.create_download('--iso-url', INSTALLER_URL,
+                                  '--iso-sha256', DOWNLOAD_SHA256.upper(),
+                                  '--no-start', '--execute')
+    self.assert_success(result)
+    guest_dir = self.storage / 'LabVM'
+    self.assertEqual((guest_dir / 'install.iso').read_bytes(), DOWNLOAD_BYTES)
+    self.assertFalse((guest_dir / 'install.iso.part').exists())
+    calls = self.commands('curl')
+    self.assertEqual(len(calls), 1)
+    self.assert_https_download(calls[0], INSTALLER_URL)
+    destination = calls[0]['args'][calls[0]['args'].index('--output') + 1]
+    self.assertEqual(destination, str(guest_dir / 'install.iso.part'))
+    ordered_tools = [r['tool'] for r in self.commands()]
+    self.assertLess(ordered_tools.index('curl'), ordered_tools.index('qemu-img'))
+    root = ET.parse(self.state / 'LabVM.xml').getroot()
+    self.assertTrue(any(
+      d.get('device') == 'cdrom' and
+      d.find('source').get('file') == str(guest_dir / 'install.iso')
+      for d in root.findall('devices/disk')
+    ))
+
+  def test_iso_argument_accepts_https_source_without_optional_checksum(self):
+    result = self.create_download('--iso', INSTALLER_URL,
+                                  '--no-start', '--execute')
+    self.assert_success(result)
+    self.assertEqual((self.storage / 'LabVM' / 'install.iso').read_bytes(),
+                     DOWNLOAD_BYTES)
+    self.assert_https_download(self.commands('curl')[0], INSTALLER_URL)
+
+  def test_local_iso_accepts_matching_sha256_without_download(self):
+    digest = hashlib.sha256(self.iso.read_bytes()).hexdigest()
+    result = self.create('--iso-sha256', digest, '--no-start', '--execute')
+    self.assert_success(result)
+    self.assertEqual(self.commands('curl'), [])
+    self.assertEqual((self.storage / 'LabVM' / 'install.iso').read_bytes(),
+                     self.iso.read_bytes())
+
+  def test_local_iso_checksum_mismatch_preserves_source_and_creates_no_disk(self):
+    original = self.iso.read_bytes()
+    result = self.create('--iso-sha256', '0' * 64, '--execute')
+    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertEqual(self.iso.read_bytes(), original)
+    self.assertEqual(self.commands('curl'), [])
+    self.assert_no_disk_or_definition()
+
+  def test_latest_arch_selects_pinned_release_and_automatic_os_variant(self):
+    result = self.create_download('--arch-latest', '--no-start', '--execute')
+    self.assert_success(result)
+    guest_dir = self.storage / 'LabVM'
+    self.assertEqual((guest_dir / 'install.iso').read_bytes(), DOWNLOAD_BYTES)
+    self.assertFalse((guest_dir / 'install.iso.part').exists())
+    metadata = json.loads((guest_dir / 'arch-release.json').read_text())
+    self.assertEqual(metadata['latest_version'], ARCH_VERSION)
+    calls = self.commands('curl')
+    self.assertEqual(len(calls), 2)
+    self.assert_https_download(calls[0], ARCH_RELEASES_URL)
+    self.assert_https_download(calls[1], ARCH_ISO_URL)
+    self.assertNotIn('/latest/', calls[1]['args'][-1])
+    installer = self.commands('virt-install')[0]['args']
+    self.assertEqual(installer[installer.index('--osinfo') + 1], 'archlinux')
+
+  def test_latest_arch_preserves_explicit_os_variant(self):
+    result = self.create_download('--arch-latest', '--os-variant', 'generic',
+                                  '--no-start', '--execute')
+    self.assert_success(result)
+    installer = self.commands('virt-install')[0]['args']
+    self.assertEqual(installer[installer.index('--osinfo') + 1], 'generic')
+
+  def test_latest_arch_rejects_invalid_metadata_before_downloading_iso(self):
+    cases = ('wrong-schema', 'missing-latest', 'missing-release', 'unavailable',
+             'availability-string', 'duplicate-release', 'bad-version',
+             'bad-hash', 'missing-hash', 'bad-url', 'insecure-url',
+             'invalid-json')
+    for index, invalid in enumerate(cases):
+      with self.subTest(metadata=invalid):
+        result = self.run_cli(
+          'create', '--name', f'InvalidMetadata{index}', '--storage-dir',
+          self.storage, '--arch-latest', '--execute',
+          QVM_ARCH_BAD_METADATA=invalid,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    calls = self.commands('curl')
+    self.assertEqual(len(calls), len(cases))
+    for call in calls:
+      self.assert_https_download(call, ARCH_RELEASES_URL)
+    self.assert_no_disk_or_definition()
+
+  def test_latest_arch_automatically_rejects_iso_checksum_mismatch(self):
+    result = self.create_download('--arch-latest', '--execute',
+                                  QVM_ISO_BAD_HASH='1')
+    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertTrue((self.storage / 'LabVM' / 'install.iso.part').exists())
+    self.assertFalse((self.storage / 'LabVM' / 'install.iso').exists())
+    self.assert_no_disk_or_definition()
+
+  def test_explicit_url_checksum_mismatch_preserves_partial_download(self):
+    result = self.create_download('--iso-url', INSTALLER_URL,
+                                  '--iso-sha256', '0' * 64, '--execute')
+    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertTrue((self.storage / 'LabVM' / 'install.iso.part').exists())
+    self.assertFalse((self.storage / 'LabVM' / 'install.iso').exists())
+    self.assert_no_disk_or_definition()
+
+  def test_failed_download_preserves_partial_file_and_does_not_create_disk(self):
+    result = self.create_download('--iso-url', INSTALLER_URL, '--execute',
+                                  QVM_CURL_FAIL='iso')
+    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertEqual((self.storage / 'LabVM' / 'install.iso.part').read_bytes(),
+                     b'partial transfer\n')
+    self.assertFalse((self.storage / 'LabVM' / 'install.iso').exists())
+    self.assert_no_disk_or_definition()
+
+  def test_empty_download_does_not_publish_iso_or_create_disk(self):
+    result = self.create_download('--iso-url', INSTALLER_URL, '--execute',
+                                  QVM_CURL_EMPTY='iso')
+    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertTrue((self.storage / 'LabVM' / 'install.iso.part').exists())
+    self.assertFalse((self.storage / 'LabVM' / 'install.iso').exists())
+    self.assert_no_disk_or_definition()
+
+  def test_failed_arch_metadata_download_never_requests_iso(self):
+    result = self.create_download('--arch-latest', '--execute',
+                                  QVM_CURL_FAIL='metadata')
+    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertEqual(len(self.commands('curl')), 1)
+    self.assert_https_download(self.commands('curl')[0], ARCH_RELEASES_URL)
+    self.assertEqual(
+      (self.storage / 'LabVM' / 'arch-release.json.part').read_bytes(),
+      b'partial transfer\n',
+    )
+    self.assert_no_disk_or_definition()
+
+  def test_empty_arch_metadata_download_never_requests_iso(self):
+    result = self.create_download('--arch-latest', '--execute',
+                                  QVM_CURL_EMPTY='metadata')
+    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertEqual(len(self.commands('curl')), 1)
+    self.assert_https_download(self.commands('curl')[0], ARCH_RELEASES_URL)
+    self.assertTrue((self.storage / 'LabVM' / 'arch-release.json.part').exists())
+    self.assert_no_disk_or_definition()
 
   def test_host_identification_preserves_guest_name(self):
     if 'ID=arch\n' not in Path('/etc/os-release').read_text():

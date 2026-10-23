@@ -15,6 +15,12 @@ WITH_SETUP=0
 WITH_MANAGER=0
 NAME=''
 ISO=''
+ISO_URL=''
+ISO_SHA256=''
+ARCH_LATEST=0
+ARCH_RELEASE=''
+ARCH_RELEASES_URL='https://archlinux.org/releng/releases/json/'
+ARCH_MIRROR_URL='https://geo.mirror.pkgbuild.com'
 DRIVER_ISO=''
 GUEST='linux'
 MEMORY=''
@@ -69,7 +75,11 @@ Host setup:
 
 Guest creation:
   --name NAME              Unique VM name, starting with a letter (max 64)
-  --iso PATH               Local bootable installation ISO (optional)
+  --iso PATH_OR_URL        Local installation ISO or HTTPS URL (optional)
+  --iso-url URL            Download an installation ISO from an HTTPS URL
+  --iso-sha256 HEX          Expected SHA-256 for --iso or --iso-url (64 hex)
+  --arch-latest            Fetch the newest official Arch ISO and verify its
+                           published SHA-256; defaults OS variant to archlinux
   --driver-iso PATH        Optional second ISO, e.g. Windows VirtIO drivers
   --guest linux|windows    Defaults: linux / Windows 11-oriented settings
   --os-variant ID          libosinfo ID (default: generic / win11)
@@ -102,16 +112,56 @@ General:
   -h, --help               Show this help
 
 Examples:
+  # Preview host setup, then install dependencies and configure libvirt.
   ./qemu-vm.sh setup --with-manager
   ./qemu-vm.sh setup --with-manager --execute
-  ./qemu-vm.sh create --name ArchLab --iso ~/Downloads/archlinux.iso \
+
+  # Preview an Arch guest using a local ISO and an 80 GiB disk.
+  ./qemu-vm.sh create --name ArchLab \
+    --iso "$HOME/Downloads/archlinux-x86_64.iso" \
     --os-variant archlinux --memory 4096 --vcpus 4 --disk-size 80
+
+  # Fetch the latest Arch ISO, verify it, and create a powered-off guest.
+  ./qemu-vm.sh create --name ArchLatest --arch-latest \
+    --memory 4096 --vcpus 4 --disk-size 80 --no-start --execute
+
+  # Set up the host and create a guest in the same invocation.
+  ./qemu-vm.sh create --setup --with-manager --name ArchPrepared \
+    --arch-latest --no-start --execute
+
+  # Preview a guest from an installer URL; replace the example URL.
+  ./qemu-vm.sh create --name DownloadedLab \
+    --iso-url 'https://example.org/installer.iso' --no-start
+
+  # Windows 11 defaults include Secure Boot and a TPM 2.0 emulator.
   ./qemu-vm.sh create --name Windows11 --guest windows \
-    --iso /path/Windows11.iso --no-start --execute
+    --iso "$HOME/Downloads/Windows11.iso" --no-start
+
+  # Preview Windows with VirtIO devices and a separate driver CD-ROM.
+  ./qemu-vm.sh create --name WindowsVirtIO --guest windows \
+    --iso "$HOME/Downloads/Windows11.iso" \
+    --driver-iso "$HOME/Downloads/virtio-win.iso" \
+    --disk-bus virtio --nic-model virtio --no-start
+
+  # Four vCPUs with a 50% CPU budget and an 8 GiB balloon ceiling.
+  ./qemu-vm.sh create --name LimitedLab --arch-latest \
+    --vcpus 4 --cpu-limit 50 --memory 4096 --memory-max 8192
+
+  # Preview an offline guest with 2 GiB RAM and a 32 GiB disk.
+  ./qemu-vm.sh create --name OfflineLab --arch-latest \
+    --network none --memory 2048 --disk-size 32 --no-start
+
+  # Preview a guest attached to an existing Linux bridge named br0.
+  ./qemu-vm.sh create --name BridgedLab --arch-latest --network bridge=br0
+
+  # Shut down ArchLab normally after installation, then eject and start.
   ./qemu-vm.sh eject-iso --name ArchLab --execute
   ./qemu-vm.sh start --name ArchLab --execute
+  virt-viewer --connect qemu:///system ArchLab
   ./qemu-vm.sh info --name ArchLab
 
+Replace example paths/URLs with your files. Add --execute to apply a preview.
+Previews do not contact the network. Use only one installation ISO source.
 No existing VM or disk is reconfigured or overwritten by create.
 eject-iso requires a powered-off VM and ejects its first CD-ROM only.
 Guest OS installation remains interactive in virt-viewer or virt-manager.
@@ -278,7 +328,13 @@ function parse_args() {
         CREATE_OPTIONS+=("$option")
         shift
         ;;
-      --iso | --driver-iso | --guest | --os-variant | --memory | \
+      --arch-latest)
+        ARCH_LATEST=1
+        CREATE_OPTIONS+=("$option")
+        shift
+        ;;
+      --iso | --iso-url | --iso-sha256 | --driver-iso | --guest | \
+        --os-variant | --memory | \
         --memory-max | --vcpus | --disk-size | --storage-dir | --disk-bus | \
         --nic-model | --cpu | --cpu-shares | --cpu-limit | --network | \
         --graphics | --secure-boot | --boot)
@@ -286,6 +342,8 @@ function parse_args() {
         CREATE_OPTIONS+=("$option")
         case "$option" in
           --iso) ISO=$2 ;;
+          --iso-url) ISO_URL=$2 ;;
+          --iso-sha256) ISO_SHA256=$2 ;;
           --driver-iso) DRIVER_ISO=$2 ;;
           --guest) GUEST=$2 ;;
           --os-variant) OS_VARIANT=$2 ;;
@@ -341,6 +399,7 @@ function check_host() {
 }
 
 function validate_create() {
+  validate_iso_source
   case "$GUEST" in
     linux)
       MEMORY=${MEMORY:-4096}
@@ -399,8 +458,8 @@ function validate_create() {
   [[ "$STORAGE_DIR" != / ]] || die 'Use a dedicated storage parent directory.'
   VM_DIR="$STORAGE_DIR/$NAME"
   DISK_PATH="$VM_DIR/disk.qcow2"
-  if [[ -n "$ISO" ]]; then
-    ISO=$(resolve_iso "$ISO")
+  if [[ -n "$ISO" ]]; then ISO=$(resolve_iso "$ISO"); fi
+  if [[ -n "$ISO" || -n "$ISO_URL" ]] || ((ARCH_LATEST)); then
     MEDIA_PATH="$VM_DIR/install.iso"
     BOOT_FROM=${BOOT_FROM:-iso}
   else
@@ -411,12 +470,49 @@ function validate_create() {
     DRIVER_PATH="$VM_DIR/drivers.iso"
   fi
   case "$BOOT_FROM" in
-    iso) [[ -n "$ISO" ]] || die '--boot iso requires --iso.' ;;
+    iso)
+      [[ -n "$MEDIA_PATH" ]] ||
+        die '--boot iso requires --iso, --iso-url, or --arch-latest.'
+      ;;
     disk) ;;
     *) die '--boot must be iso or disk.' ;;
   esac
   [[ ! -e "$VM_DIR" && ! -L "$VM_DIR" ]] ||
     die "VM storage already exists; nothing overwritten: $VM_DIR"
+}
+
+function validate_iso_source() {
+  local sources=0 authority=''
+  if [[ "$ISO" == *://* ]]; then
+    [[ -z "$ISO_URL" ]] || die 'Use only one installation ISO source.'
+    ISO_URL=$ISO
+    ISO=''
+  fi
+  [[ -z "$ISO" ]] || sources=$((sources + 1))
+  [[ -z "$ISO_URL" ]] || sources=$((sources + 1))
+  ((ARCH_LATEST == 0)) || sources=$((sources + 1))
+  ((sources <= 1)) ||
+    die 'Use only one of --iso, --iso-url, and --arch-latest.'
+  if [[ -n "$ISO_URL" ]]; then
+    authority=${ISO_URL#https://}
+    authority=${authority%%[/?#]*}
+    [[ "$ISO_URL" == https://* && -n "$authority" &&
+      "$authority" != *@* && "$ISO_URL" != *'#'* &&
+      ! "$ISO_URL" =~ [[:space:][:cntrl:]] ]] ||
+      die 'ISO URLs must use HTTPS, with no credentials, spaces, or fragment.'
+  fi
+  if [[ -n "$ISO_SHA256" ]]; then
+    [[ "$ISO_SHA256" =~ ^[[:xdigit:]]{64}$ ]] ||
+      die '--iso-sha256 must contain exactly 64 hexadecimal characters.'
+    ((sources == 1)) || die '--iso-sha256 requires an installation ISO source.'
+    ((ARCH_LATEST == 0)) ||
+      die '--arch-latest obtains its SHA-256 from official release metadata.'
+    ISO_SHA256=${ISO_SHA256,,}
+  fi
+  if ((ARCH_LATEST)); then
+    [[ "$GUEST" == linux ]] || die '--arch-latest requires --guest linux.'
+    OS_VARIANT=${OS_VARIANT:-archlinux}
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -453,7 +549,7 @@ function detect_daemon_mode() {
 
 function setup_host() {
   local packages=(qemu-desktop libvirt virt-install virt-viewer edk2-ovmf
-    virt-firmware swtpm dnsmasq nftables)
+    virt-firmware swtpm dnsmasq nftables curl ca-certificates)
   local units=() network_names='' active_names='' default_xml='' mode=''
   ((WITH_MANAGER == 0)) || packages+=(virt-manager)
   step 'Install dependencies; --needed skips reinstalling current packages'
@@ -746,6 +842,10 @@ function create_vm() {
   require_command virt-install
   require_command qemu-img
   require_command python3
+  if [[ -n "$ISO_URL" ]] || ((ARCH_LATEST)); then require_command curl; fi
+  if [[ -n "$ISO_SHA256" ]] || ((ARCH_LATEST)); then
+    require_command sha256sum
+  fi
   [[ "$SECURE_BOOT" != on ]] || require_command virt-fw-vars
   check_connection
   ensure_kvm
@@ -788,7 +888,17 @@ function create_vm() {
 }
 
 function preview_storage() {
-  if [[ -n "$ISO" ]]; then
+  if ((ARCH_LATEST)); then
+    download_file "$ARCH_RELEASES_URL" "$VM_DIR/arch-release.json.part"
+    printf '  Resolve the newest available Arch release and its SHA-256.\n'
+    printf '  Fetch its dated ISO from %s/iso/<release>/\n' "$ARCH_MIRROR_URL"
+    printf '  Verify SHA-256, then rename install.iso.part to install.iso.\n'
+  elif [[ -n "$ISO_URL" ]]; then
+    download_file "$ISO_URL" "$MEDIA_PATH.part"
+    printf '  Verify the download is nonempty'
+    if [[ -n "$ISO_SHA256" ]]; then printf ' and matches --iso-sha256'; fi
+    printf '; rename it to install.iso.\n'
+  elif [[ -n "$ISO" ]]; then
     print_command "${ROOT[@]}" cp --reflink=auto --sparse=always --no-clobber \
       -- "$ISO" "$MEDIA_PATH"
   fi
@@ -807,11 +917,14 @@ function preview_storage() {
 
 function prepare_storage() {
   step 'Stage media and create a new sparse qcow2 disk'
-  if [[ -n "$ISO" ]]; then
+  if [[ -n "$ISO_URL" ]] || ((ARCH_LATEST)); then
+    prepare_downloaded_iso
+  elif [[ -n "$ISO" ]]; then
     mutate cp --reflink=auto --sparse=always --no-clobber -- "$ISO" "$MEDIA_PATH"
     mutate chmod 0644 -- "$MEDIA_PATH"
     "${ROOT[@]}" cmp -s -- "$ISO" "$MEDIA_PATH" ||
       die "Staged installation ISO differs from the source. Inspect $VM_DIR"
+    [[ -z "$ISO_SHA256" ]] || verify_iso_checksum "$MEDIA_PATH"
   fi
   if [[ -n "$DRIVER_ISO" ]]; then
     mutate cp --reflink=auto --sparse=always --no-clobber \
@@ -831,6 +944,94 @@ function prepare_storage() {
     "$DISK_PATH" "${DISK_SIZE}G"
   # libvirt's dynamic ownership grants its QEMU user access when the guest starts.
   mutate chmod 0600 -- "$DISK_PATH"
+}
+
+# ---------------------------------------------------------------------------
+# Remote ISO sources: HTTPS, pinned Arch release metadata, atomic publication
+# ---------------------------------------------------------------------------
+
+function download_file() {
+  local url=$1 destination=$2
+  # -q ignores curlrc. Restrict the initial URL and every redirect to HTTPS.
+  local arguments=(curl -q --globoff --fail --location --show-error --progress-bar
+    --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 15
+    --output "$destination" -- "$url")
+  mutate "${arguments[@]}"
+  if ((EXECUTE)); then
+    "${ROOT[@]}" test -s "$destination" ||
+      die "Download is empty; retained for inspection: $destination"
+  fi
+}
+
+function resolve_arch_latest() {
+  local metadata="$VM_DIR/arch-release.json.part" release_info=''
+  step 'Resolve the latest available release from official Arch metadata'
+  download_file "$ARCH_RELEASES_URL" "$metadata"
+  release_info=$(
+    "${ROOT[@]}" python3 - "$metadata" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+data = json.loads(Path(sys.argv[1]).read_text())
+if not isinstance(data, dict) or data.get('version') != 1:
+  raise SystemExit('Unsupported Arch release metadata format.')
+version = data.get('latest_version')
+if not isinstance(version, str) or not re.fullmatch(r'\d{4}\.\d{2}\.\d{2}',
+                                                  version):
+  raise SystemExit('Invalid latest Arch release version.')
+releases = data.get('releases')
+if not isinstance(releases, list):
+  raise SystemExit('Missing Arch release list.')
+matches = [r for r in releases if isinstance(r, dict) and
+           r.get('version') == version]
+if len(matches) != 1 or matches[0].get('available') is not True:
+  raise SystemExit('The newest Arch ISO is not available in release metadata.')
+release = matches[0]
+expected_path = f'/iso/{version}/archlinux-{version}-x86_64.iso'
+if release.get('iso_url') != expected_path:
+  raise SystemExit('Unexpected Arch ISO path in release metadata.')
+checksum = release.get('sha256_sum')
+if not isinstance(checksum, str) or not re.fullmatch(r'[0-9a-fA-F]{64}',
+                                                    checksum):
+  raise SystemExit('Missing or invalid Arch ISO SHA-256 checksum.')
+print(version)
+print(checksum.lower())
+PY
+  )
+  ARCH_RELEASE=${release_info%%$'\n'*}
+  ISO_SHA256=${release_info#*$'\n'}
+  ISO_URL="$ARCH_MIRROR_URL/iso/$ARCH_RELEASE"
+  ISO_URL+="/archlinux-$ARCH_RELEASE-x86_64.iso"
+  mutate mv --no-clobber -- "$metadata" "$VM_DIR/arch-release.json"
+  printf '  Selected Arch Linux %s; SHA-256: %s\n' \
+    "$ARCH_RELEASE" "$ISO_SHA256"
+}
+
+function verify_iso_checksum() {
+  local image=$1 actual=''
+  step 'Verify the installation ISO SHA-256'
+  actual=$("${ROOT[@]}" sha256sum -- "$image")
+  # GNU sha256sum prefixes a backslash when the filename needs escaping.
+  actual=${actual#\\}
+  actual=${actual%% *}
+  [[ "$actual" == "$ISO_SHA256" ]] ||
+    die "ISO SHA-256 mismatch; retained for inspection: $image"
+  printf '  Verified SHA-256: %s\n' "$actual"
+}
+
+function prepare_downloaded_iso() {
+  local partial="$MEDIA_PATH.part"
+  if ((ARCH_LATEST)); then resolve_arch_latest; fi
+  step 'Download the installation ISO over HTTPS'
+  download_file "$ISO_URL" "$partial"
+  [[ -z "$ISO_SHA256" ]] || verify_iso_checksum "$partial"
+  # Keep the completed download separate until all requested checks succeed.
+  mutate mv --no-clobber -- "$partial" "$MEDIA_PATH"
+  "${ROOT[@]}" test ! -e "$partial" ||
+    die "Installation ISO already exists; download retained: $partial"
+  mutate chmod 0644 -- "$MEDIA_PATH"
 }
 
 # ---------------------------------------------------------------------------
