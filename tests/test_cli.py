@@ -33,6 +33,9 @@ source "$1"
 shift
 function ensure_kvm() { :; }
 function check_host() { :; }
+if [[ "${QVM_FAKE_DESKTOP:-1}" == 1 ]]; then
+  function check_desktop_session() { :; }
+fi
 if [[ "${QVM_MISSING_FIRMWARE:-}" == 1 ]]; then
   function discover_secure_firmware() { die 'Fixture firmware is absent.'; }
 fi
@@ -77,6 +80,8 @@ elif tool == 'qemu-img':
   os.execv(os.environ['QVM_REAL_QEMU_IMG'], ['qemu-img', *args])
 elif tool == 'pacman':
   pass
+elif tool == 'virt-viewer':
+  print('fixture viewer: ' + args[-1])
 elif tool == 'curl':
   destination = Path(argument('--output'))
   url = args[-1]
@@ -195,7 +200,8 @@ elif tool == 'virsh':
       for entry in state.glob('*.xml'):
         print(entry.stem)
   elif command == 'net-list':
-    if os.environ.get('QVM_MISSING_NETWORK') != '1':
+    if (os.environ.get('QVM_MISSING_NETWORK') != '1' and
+        ('--all' in args or os.environ.get('QVM_INACTIVE_NETWORK') != '1')):
       print('default')
   elif command == 'define':
     if os.environ.get('QVM_DEFINE_RACE'):
@@ -219,6 +225,9 @@ elif tool == 'virsh':
         if source is not None:
           disk.remove(source)
     location.write_text(ET.tostring(root, encoding='unicode'))
+  elif command == 'net-start' and os.environ.get('QVM_NET_START_ERROR'):
+    print(os.environ['QVM_NET_START_ERROR'], file=sys.stderr)
+    raise SystemExit(1)
   elif command in ('start', 'autostart', 'net-start', 'net-autostart',
                    'net-define', 'dominfo', 'domblklist', 'domiflist'):
     print('fixture: ' + command)
@@ -247,7 +256,7 @@ class CliSafetyTests(unittest.TestCase):
     dispatcher.write_text(DISPATCHER)
     dispatcher.chmod(0o755)
     for tool in ('sudo', 'pacman', 'curl', 'systemctl', 'virsh', 'virt-install',
-                 'virt-fw-vars', 'qemu-img'):
+                 'virt-fw-vars', 'qemu-img', 'virt-viewer'):
       (self.bin / tool).symlink_to(dispatcher)
     self.env = dict(os.environ)
     self.env.update({
@@ -408,6 +417,23 @@ class CliSafetyTests(unittest.TestCase):
     self.assertEqual((self.storage / 'LabVM' / 'install.iso').read_bytes(),
                      DOWNLOAD_BYTES)
     self.assert_https_download(self.commands('curl')[0], INSTALLER_URL)
+
+  def test_creation_ignores_shadowed_privileged_test_executable(self):
+    marker = self.base / 'shadowed-test-was-invoked'
+    shadowed = self.bin / 'test'
+    shadowed.write_text(
+      '#!/bin/sh\nprintf shadowed > "$QVM_SHADOW_TEST_MARKER"\nexit 99\n',
+    )
+    shadowed.chmod(0o755)
+    result = self.create_download('--iso-url', INSTALLER_URL,
+                                  '--iso-sha256', DOWNLOAD_SHA256,
+                                  '--no-start', '--execute',
+                                  QVM_SHADOW_TEST_MARKER=str(marker))
+    self.assert_success(result)
+    self.assertFalse(marker.exists(), 'Privileged checks must use coreutils')
+    self.assertEqual((self.storage / 'LabVM' / 'install.iso').read_bytes(),
+                     DOWNLOAD_BYTES)
+    self.assertTrue((self.state / 'LabVM.xml').exists())
 
   def test_local_iso_accepts_matching_sha256_without_download(self):
     digest = hashlib.sha256(self.iso.read_bytes()).hexdigest()
@@ -749,7 +775,140 @@ class CliSafetyTests(unittest.TestCase):
     self.assertEqual({record['tool'] for record in self.commands()} -
                      {'sudo', 'virt-install', 'virsh'}, set())
     self.assertEqual([record['args'][2] for record in self.commands('virsh')],
-                     ['list', 'net-list'])
+                     ['list', 'net-list', 'net-list'])
+
+  def test_doctor_reports_inactive_default_network_without_starting_it(self):
+    result = self.run_cli('doctor', QVM_INACTIVE_NETWORK='1')
+    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertIn('default', result.stderr.lower())
+    self.assertIn('network-start --execute', result.stderr)
+    self.assertEqual([record['args'][2] for record in self.commands('virsh')],
+                     ['list', 'net-list', 'net-list'])
+    self.assertEqual(self.commands('virt-viewer'), [])
+    self.assertEqual(self.commands('systemctl'), [])
+
+  def test_network_start_preview_does_not_change_host(self):
+    result = self.run_cli('network-start')
+    self.assert_success(result)
+    self.assertIn('net-start default', result.stdout)
+    self.assertIn('net-autostart default', result.stdout)
+    self.assertEqual(self.commands(), [])
+
+  def test_network_start_enables_existing_inactive_network(self):
+    result = self.run_cli('network-start', '--execute',
+                          QVM_INACTIVE_NETWORK='1')
+    self.assert_success(result)
+    actions = [record['args'][2] for record in self.commands('virsh')]
+    self.assertEqual(actions,
+                     ['list', 'net-list', 'net-list', 'net-start',
+                      'net-autostart'])
+    self.assertEqual(self.commands('pacman'), [])
+    self.assertEqual(self.commands('systemctl'), [])
+
+  def test_network_start_does_not_restart_active_network(self):
+    result = self.run_cli('network-start', '--execute')
+    self.assert_success(result)
+    actions = [record['args'][2] for record in self.commands('virsh')]
+    self.assertEqual(actions,
+                     ['list', 'net-list', 'net-list', 'net-autostart'])
+
+  def test_network_start_missing_network_requires_setup(self):
+    result = self.run_cli('network-start', '--execute',
+                          QVM_MISSING_NETWORK='1')
+    self.assert_failure(result, 'setup --execute')
+    actions = [record['args'][2] for record in self.commands('virsh')]
+    self.assertEqual(actions, ['list', 'net-list'])
+    self.assertEqual(self.commands('pacman'), [])
+
+  def test_network_start_reports_missing_firewalld_zone_without_reloading(self):
+    message = ("firewalld can't find the 'libvirt' zone that should have been "
+               'installed with libvirt')
+    result = self.run_cli('network-start', '--execute',
+                          QVM_INACTIVE_NETWORK='1',
+                          QVM_NET_START_ERROR=message)
+    self.assert_failure(result, 'Firewalld has not loaded the libvirt')
+    self.assertIn(message, result.stderr)
+    self.assertIn('review runtime', result.stderr)
+    self.assertIn('runtime-only firewall changes', result.stderr)
+    self.assertIn('No guest was created', result.stderr)
+    actions = [record['args'][2] for record in self.commands('virsh')]
+    self.assertEqual(actions,
+                     ['list', 'net-list', 'net-list', 'net-start'])
+    self.assertEqual({record['tool'] for record in self.commands()} -
+                     {'sudo', 'virsh'}, set())
+    self.assertFalse(self.storage.exists())
+    self.assertEqual(list(self.state.glob('*.xml')), [])
+
+  def seed_graphical_guest(self, graphics='spice'):
+    self.seed_media_guest()
+    location = self.state / 'LabVM.xml'
+    root = ET.fromstring(location.read_text())
+    if graphics:
+      ET.SubElement(root.find('devices'), 'graphics', type=graphics)
+    location.write_text(ET.tostring(root, encoding='unicode'))
+
+  def test_connect_preview_never_queries_or_opens_guest(self):
+    result = self.run_cli('connect', '--name', 'LabVM')
+    self.assert_success(result)
+    self.assertIn('virt-viewer', result.stdout)
+    self.assertEqual(self.commands(), [])
+
+  def test_connect_starts_powered_off_guest_then_opens_unprivileged_viewer(self):
+    self.seed_graphical_guest()
+    result = self.run_cli('connect', '--name', 'LabVM', '--execute')
+    self.assert_success(result)
+    viewers = self.commands('virt-viewer')
+    self.assertEqual(len(viewers), 1)
+    self.assertEqual(viewers[0]['args'],
+                     ['--connect', 'qemu:///system', '--wait', '--attach', 'LabVM'])
+    records = self.commands()
+    start = next(index for index, record in enumerate(records)
+                 if record['tool'] == 'virsh' and record['args'][2] == 'start')
+    viewer = next(index for index, record in enumerate(records)
+                  if record['tool'] == 'virt-viewer')
+    self.assertLess(start, viewer)
+    self.assertFalse(any('virt-viewer' in record['args']
+                         for record in self.commands('sudo')))
+
+  def test_connect_running_guest_opens_without_restarting(self):
+    self.seed_graphical_guest('vnc')
+    result = self.run_cli('connect', '--name', 'LabVM', '--execute',
+                          QVM_GUEST_STATE='running')
+    self.assert_success(result)
+    self.assertEqual(len(self.commands('virt-viewer')), 1)
+    self.assertFalse(any(record['args'][2] == 'start'
+                         for record in self.commands('virsh')))
+
+  def test_connect_requires_desktop_before_guest_changes(self):
+    self.seed_graphical_guest()
+    result = self.run_cli('connect', '--name', 'LabVM', '--execute',
+                          QVM_FAKE_DESKTOP='0', WAYLAND_DISPLAY='', DISPLAY='')
+    self.assert_failure(result, 'desktop')
+    self.assertEqual(self.commands(), [])
+
+  def test_connect_refuses_headless_guest_before_start(self):
+    self.seed_graphical_guest(graphics=None)
+    result = self.run_cli('connect', '--name', 'LabVM', '--execute')
+    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertEqual(self.commands('virt-viewer'), [])
+    self.assertFalse(any(record['args'][2] == 'start'
+                         for record in self.commands('virsh')))
+
+  def test_connect_refuses_paused_guest_without_changing_state(self):
+    self.seed_graphical_guest()
+    result = self.run_cli('connect', '--name', 'LabVM', '--execute',
+                          QVM_GUEST_STATE='paused')
+    self.assert_failure(result, 'paused')
+    self.assertEqual(self.commands('virt-viewer'), [])
+    self.assertFalse(any(record['args'][2] == 'start'
+                         for record in self.commands('virsh')))
+
+  def test_connect_reports_viewer_failure(self):
+    self.seed_graphical_guest()
+    result = self.run_cli('connect', '--name', 'LabVM', '--execute',
+                          QVM_GUEST_STATE='running',
+                          QVM_FAIL_TOOL='virt-viewer')
+    self.assert_failure(result, 'virt-viewer')
 
   def seed_media_guest(self):
     root = ET.Element('domain')

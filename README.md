@@ -8,7 +8,44 @@ The host must run x86-64 Arch Linux with AMD-V or Intel VT-x available.
 Every command that changes state previews its operation until `--execute` is
 supplied. `info` and `doctor` query system libvirt and can request sudo
 authentication. Run the script as your ordinary account; it uses sudo for the
-operations that require root. A root shell also works.
+operations that require root. Host setup and creation also work in a root shell.
+
+## Start here: guided creation and installer display
+
+Open a terminal in your desktop session, then run:
+
+```bash
+cd ~/my_repos/qemu-vm
+./qemu-vm.sh menu
+```
+
+Choose **1: Create a VM**. The guide asks for Linux or Windows, the ISO file,
+a new VM name, and resources with defaults you can accept by pressing Enter.
+It shows a short summary and asks before applying changes. Creation enables
+the existing default VM network after your confirmation. Host setup is an
+optional separate choice; it includes a full Arch package upgrade.
+
+After creation, answer **y** to open the installer window. The ISO is already
+attached to the VM. You use the installer inside that window. Later, menu
+option **2** lists your VMs and starts/opens the one you select.
+
+Running `./qemu-vm.sh` without arguments also opens this menu in a terminal.
+Noninteractive invocations without arguments still show help.
+
+Choose a **new name** when a failed attempt has retained its storage folder.
+A directory containing an ISO and disk is not yet a registered VM, so it
+cannot be opened through the VM list until creation succeeds. The menu keeps
+existing guest files; cleanup is a separate administration operation.
+
+To open an already registered VM directly:
+
+```bash
+./qemu-vm.sh connect --name AlpineLab2 --execute
+```
+
+`connect` starts the VM if it is powered off, then opens `virt-viewer` as your
+desktop user. Run it without sudo. Closing the display window leaves the VM
+running; shut down the guest normally when finished.
 
 ## Host setup
 
@@ -61,7 +98,17 @@ Check tools, KVM device presence and libvirt state:
 This reports executable availability, the selected Python/installer command,
 whether the installer runs, KVM device presence, libvirt connectivity, and the
 defined guests and networks. It returns a failure status when a required check
-fails. Firmware execution, network connectivity inside a guest, and VM boot
+fails, including an inactive default network. Enable an existing default
+network without reinstalling packages or upgrading the host:
+
+```bash
+./qemu-vm.sh network-start
+./qemu-vm.sh network-start --execute
+```
+
+This starts the network when inactive and enables its autostart. Menu option
+**5** provides the same operation with a preview and confirmation.
+Firmware execution, network connectivity inside a guest, and VM boot
 still require testing with a real guest.
 
 ## Fetch the newest Arch ISO automatically
@@ -409,6 +456,23 @@ device access on the actual host. Containers and restricted environments can
 hide KVM even when the host supports it. `doctor` reports this without trying
 to load modules or change the environment.
 
+If network startup reports `firewalld can't find the 'libvirt' zone`, check
+whether `/usr/lib/firewalld/zones/libvirt.xml` exists. Firewalld may have
+started before libvirt installed its zone files. Review runtime versus saved
+zones, policies, direct rules and IP sets before validating and reloading:
+
+```bash
+sudo firewall-cmd --check-config
+sudo firewall-cmd --reload
+./qemu-vm.sh network-start --execute
+```
+
+A reload loads saved configuration and can discard runtime-only changes.
+The script reports this failure without reloading the firewall automatically.
+See [firewalld's reload documentation][firewalld-reload].
+
+[firewalld-reload]: https://firewalld.org/documentation/man-pages/firewall-cmd.html
+
 ## Validation and limitations
 
 The script asks `virt-install` to generate one persistent boot configuration
@@ -439,16 +503,16 @@ Run them with:
 ```bash
 cd ~/my_repos/qemu-vm
 python3 -m unittest discover -s tests -v
-bash -n qemu-vm.sh
-shellcheck qemu-vm.sh
-shfmt -d -i 2 -ci qemu-vm.sh
+bash -n qemu-vm.sh lib/menu.sh
+shellcheck qemu-vm.sh lib/menu.sh
+shfmt -d -i 2 -ci qemu-vm.sh lib/menu.sh
 ```
 
 Download tests use simulated HTTPS responses, release metadata, transfer
 failures, and checksum mismatches. Small official release metadata can be
 checked separately without fetching the full ISO.
 
-`qemu-img` enables the disposable disk tests. Live dependency installation,
-libvirt/network activation, Secure Boot execution, and guest installation were
-not exercised during development. The available execution environment had no
-`/dev/kvm` and blocked access to the host system service bus.
+`qemu-img` enables the disposable disk tests. Host network activation and an
+Alpine guest's real ISO boot and graphical connection were verified on
+2026-10-23 outside the restricted execution sandbox. Full package installation,
+Secure Boot execution and completion of guest OS installation remain untested.

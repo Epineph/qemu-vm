@@ -61,9 +61,12 @@ function usage() {
 qemu-vm.sh - Arch Linux QEMU/KVM setup and persistent VM creation
 
 Usage:
+  qemu-vm.sh menu
   qemu-vm.sh setup [--with-manager] [--execute]
   qemu-vm.sh create --name NAME [options] [--execute]
   qemu-vm.sh start --name NAME [--execute]
+  qemu-vm.sh connect --name NAME [--execute]
+  qemu-vm.sh network-start [--execute]
   qemu-vm.sh eject-iso --name NAME [--execute]
   qemu-vm.sh info --name NAME
   qemu-vm.sh doctor
@@ -71,6 +74,10 @@ Usage:
 Changes are PREVIEWED by default. Add --execute to apply them.
 info reads libvirt state and may request sudo authentication.
 doctor checks tools, KVM and libvirt without changing host or guest settings.
+menu guides you through selecting an ISO, creating a VM and opening its display.
+connect starts a powered-off VM and opens virt-viewer as your desktop account.
+network-start enables the existing default network without installing packages.
+With no arguments, an interactive terminal opens the menu; pipes show help.
 
 Host setup:
   --setup                  Run host setup before creating the guest
@@ -116,12 +123,19 @@ General:
   -h, --help               Show this help
 
 Examples:
+  # Guided creation: choose an ISO, review the plan, then open its installer.
+  ./qemu-vm.sh menu
+
   # Preview host setup, then install dependencies and configure libvirt.
   ./qemu-vm.sh setup --with-manager
   ./qemu-vm.sh setup --with-manager --execute
 
   # Diagnose dependencies, Python conflicts, KVM and libvirt connectivity.
   ./qemu-vm.sh doctor
+
+  # Enable the existing default network, then open an existing VM's display.
+  ./qemu-vm.sh network-start --execute
+  ./qemu-vm.sh connect --name ArchLab --execute
 
   # Preview an Arch guest using a local ISO and an 80 GiB disk.
   ./qemu-vm.sh create --name ArchLab \
@@ -305,7 +319,8 @@ function parse_args() {
       usage
       exit 0
       ;;
-    setup | create | start | info | eject-iso | doctor)
+    setup | create | start | connect | info | eject-iso | doctor | menu | \
+      network-start)
       ACTION=$1
       shift
       ;;
@@ -407,7 +422,11 @@ function parse_args() {
   if ((WITH_MANAGER)) && [[ "$ACTION" != setup ]] && ! ((WITH_SETUP)); then
     die '--with-manager requires setup or create --setup.'
   fi
-  if [[ "$ACTION" == setup || "$ACTION" == doctor ]]; then
+  if [[ "$ACTION" == menu ]] && ((EXECUTE || explicit_preview)); then
+    die 'menu asks before applying changes; run it without execution flags.'
+  fi
+  if [[ "$ACTION" == setup || "$ACTION" == doctor || "$ACTION" == menu ||
+    "$ACTION" == network-start ]]; then
     [[ -z "$NAME" ]] || die "$ACTION does not accept --name."
   else
     [[ "$NAME" =~ ^[A-Za-z][A-Za-z0-9_.-]{0,63}$ ]] ||
@@ -623,7 +642,7 @@ function setup_host() {
   fi
   active_names=$("${VIRSH[@]}" net-list --name)
   if ! contains_line "$active_names" default; then
-    mutate virsh --connect "$VM_URI" net-start default
+    start_libvirt_network default
   fi
   mutate virsh --connect "$VM_URI" net-autostart default
   ensure_kvm
@@ -654,7 +673,7 @@ function ensure_kvm() {
 }
 
 function doctor_host() {
-  local failed=0 tool=''
+  local failed=0 tool='' active_networks=''
   step 'Read-only host diagnostics'
   printf '  Host: %s; libvirt connection: %s\n' "$(uname -srm)" "$VM_URI"
   printf '  Shell Python: %s\n' "$(command -v python3 || true)"
@@ -682,6 +701,16 @@ function doctor_host() {
   if command -v virsh >/dev/null 2>&1; then
     if "${VIRSH[@]}" list --all; then
       if ! "${VIRSH[@]}" net-list --all; then failed=1; fi
+      if active_networks=$("${VIRSH[@]}" net-list --name); then
+        if ! contains_line "$active_networks" default; then
+          printf 'Error: the default VM network is absent or inactive.\n' >&2
+          printf 'If it exists, enable it without reinstalling packages:\n' >&2
+          print_command "$0" network-start --execute >&2
+          failed=1
+        fi
+      else
+        failed=1
+      fi
     else
       printf 'Error: cannot connect to system libvirt. Run setup --execute\n' >&2
       printf 'on the host, then rerun doctor.\n' >&2
@@ -690,6 +719,41 @@ function doctor_host() {
   fi
   ((failed == 0)) || die 'Host diagnostics found the problems listed above.'
   printf 'Host diagnostics passed. Guest boot has not been tested.\n'
+}
+
+function start_default_network() {
+  local names='' active=''
+  if ((EXECUTE)); then
+    check_connection
+    names=$("${VIRSH[@]}" net-list --all --name)
+    contains_line "$names" default ||
+      die "The default network is missing. Run: $0 setup --execute"
+    active=$("${VIRSH[@]}" net-list --name)
+  fi
+  step 'Enable the default VM network now and at future host boots'
+  if ((! EXECUTE)) || ! contains_line "$active" default; then
+    start_libvirt_network default
+  fi
+  mutate virsh --connect "$VM_URI" net-autostart default
+}
+
+function start_libvirt_network() {
+  local network=$1 output=''
+  print_command "${VIRSH[@]}" net-start "$network"
+  if ((! EXECUTE)); then return; fi
+  if output=$("${VIRSH[@]}" net-start "$network" 2>&1); then
+    printf '%s\n' "$output"
+  else
+    printf '%s\n' "$output" >&2
+    if [[ "$output" == *"firewalld can't find"* &&
+      "$output" == *"libvirt"* ]]; then
+      printf '\nFirewalld has not loaded the libvirt network zone.\n' >&2
+      printf 'Check /usr/lib/firewalld/zones/libvirt.xml and review runtime\n' >&2
+      printf 'versus saved firewall rules before firewall-cmd --reload.\n' >&2
+      printf 'A reload can discard runtime-only firewall changes.\n' >&2
+    fi
+    die "Could not start network '$network'. No guest was created."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -800,7 +864,7 @@ function suboption_path() {
 }
 
 function ensure_storage_parent() {
-  if ((! EXECUTE)) || ! "${ROOT[@]}" test -d "$STORAGE_DIR"; then
+  if ((! EXECUTE)) || ! "${ROOT[@]}" /usr/bin/test -d "$STORAGE_DIR"; then
     # install -d creates missing ancestors with 0755 despite our private umask.
     # Skip existing storage roots so their permissions remain unchanged.
     mutate install -d -m 0755 -- "$STORAGE_DIR"
@@ -944,13 +1008,19 @@ function create_vm() {
   ! contains_line "$names" "$NAME" || die "VM already exists: $NAME"
   if [[ "$NETWORK" != none && "$NETWORK" != bridge=* ]]; then
     networks=$("${VIRSH[@]}" net-list --name)
-    contains_line "$networks" "$NETWORK" ||
-      die "Network '$NETWORK' is absent or inactive. Start it with virsh."
+    if ! contains_line "$networks" "$NETWORK"; then
+      if [[ "$NETWORK" == default ]]; then
+        printf 'Enable the existing default network with:\n' >&2
+        print_command "$0" network-start --execute >&2
+      fi
+      die "Network '$NETWORK' is absent or inactive. Run setup if it is missing."
+    fi
   fi
   if [[ "$SECURE_BOOT" == on ]]; then discover_secure_firmware; fi
   check_storage_traversal
   # Test as root too: a protected parent must never hide an existing directory.
-  if "${ROOT[@]}" test -e "$VM_DIR" || "${ROOT[@]}" test -L "$VM_DIR"; then
+  if "${ROOT[@]}" /usr/bin/test -e "$VM_DIR" ||
+    "${ROOT[@]}" /usr/bin/test -L "$VM_DIR"; then
     die "VM storage already exists: $VM_DIR"
   fi
   ensure_storage_parent
@@ -1049,7 +1119,7 @@ function download_file() {
     --output "$destination" -- "$url")
   mutate "${arguments[@]}"
   if ((EXECUTE)); then
-    "${ROOT[@]}" test -s "$destination" ||
+    "${ROOT[@]}" /usr/bin/test -s "$destination" ||
       die "Download is empty; retained for inspection: $destination"
   fi
 }
@@ -1120,7 +1190,7 @@ function prepare_downloaded_iso() {
   [[ -z "$ISO_SHA256" ]] || verify_iso_checksum "$partial"
   # Keep the completed download separate until all requested checks succeed.
   mutate mv --no-clobber -- "$partial" "$MEDIA_PATH"
-  "${ROOT[@]}" test ! -e "$partial" ||
+  "${ROOT[@]}" /usr/bin/test ! -e "$partial" ||
     die "Installation ISO already exists; download retained: $partial"
   mutate chmod 0644 -- "$MEDIA_PATH"
 }
@@ -1142,7 +1212,52 @@ function print_viewer() {
     print_command "${VIRSH[@]}" console "$NAME"
   else
     printf '\nOpen the graphical console from your desktop user account:\n'
-    print_command virt-viewer --connect "$VM_URI" "$NAME"
+    print_command "$0" connect --name "$NAME" --execute
+  fi
+}
+
+function check_desktop_session() {
+  ((EUID != 0)) ||
+    die 'Run connect as your desktop user, without sudo.' \
+      'The script handles VM privileges.'
+  [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]] ||
+    die 'No desktop display was found. Run connect in your desktop terminal.'
+}
+
+function connect_vm() {
+  local state='' graphics=''
+  if ((! EXECUTE)); then
+    printf 'Check %s has a graphical display; start it if powered off.\n' "$NAME"
+    printf 'Open its display as your desktop account:\n'
+    print_command virt-viewer --connect "$VM_URI" --wait --attach "$NAME"
+    return
+  fi
+  check_desktop_session
+  require_command virt-viewer
+  require_command python3
+  check_connection
+  state=$("${VIRSH[@]}" domstate "$NAME")
+  case "$state" in
+    running | 'shut off') ;;
+    *) die "VM '$NAME' is $state. Shut it down or resume it before connecting." ;;
+  esac
+  graphics=$("${VIRSH[@]}" dumpxml "$NAME" --inactive | python3 -c '
+import sys
+import xml.etree.ElementTree as ET
+root = ET.parse(sys.stdin).getroot()
+print(" ".join(g.get("type", "") for g in root.findall("devices/graphics")))
+')
+  [[ " $graphics " == *' spice '* || " $graphics " == *' vnc '* ]] ||
+    die "VM '$NAME' has no SPICE/VNC display. Use its configured serial console."
+  if [[ "$state" == 'shut off' ]]; then
+    mutate virsh --connect "$VM_URI" start "$NAME"
+  fi
+  step "Open the installer or desktop of $NAME"
+  printf 'The ISO boots inside this window. Complete installation there.\n'
+  print_command virt-viewer --connect "$VM_URI" --wait --attach "$NAME"
+  if ! virt-viewer --connect "$VM_URI" --wait --attach "$NAME"; then
+    die 'The display could not open. Check the desktop authorization prompt' \
+      'and ensure a polkit authentication agent is running.'
   fi
 }
 
@@ -1173,8 +1288,17 @@ print(disks[0].find("target").get("dev"))
 }
 
 function main() {
+  if (($# == 0)) && [[ -t 0 && -t 1 ]]; then set -- menu; fi
   parse_args "$@"
   check_host
+  if [[ "$ACTION" == menu ]]; then
+    local script_path=''
+    script_path=$(realpath -e -- "${BASH_SOURCE[0]}")
+    # shellcheck source=lib/menu.sh
+    source "${script_path%/*}/lib/menu.sh"
+    interactive_menu "$script_path"
+    return
+  fi
   [[ "$ACTION" != create ]] || validate_create
   init_privileges
   init_python_tools
@@ -1196,6 +1320,8 @@ function main() {
       show_info
       ;;
     doctor) doctor_host ;;
+    network-start) start_default_network ;;
+    connect) connect_vm ;;
     eject-iso) eject_iso ;;
   esac
 }
