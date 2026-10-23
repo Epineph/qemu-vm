@@ -1,1 +1,292 @@
-# qemu-vm
+# QEMU/KVM virtual machines on Arch Linux
+
+`qemu-vm.sh` installs the host tools and creates persistent libvirt guests from
+local installation ISOs. Run it from Bash or invoke the executable from Zsh.
+The host must run x86-64 Arch Linux with AMD-V or Intel VT-x available.
+
+Every command that changes state previews its operation until `--execute` is
+supplied. `info` queries the system libvirt connection and can request sudo
+authentication. Run the script as your ordinary account; it uses sudo for the
+operations that require root. A root shell also works.
+
+## Host setup
+
+Arch's `bash`, `coreutils`, `kmod`, `pacman`, and `systemd` provide the basic
+commands. An ordinary account needs sudo privileges. Setup installs Python and
+the remaining tools through their package dependencies.
+
+```bash
+cd ~/qemu-vm
+./qemu-vm.sh --help
+
+# Preview packages, daemon configuration, and the default NAT network.
+./qemu-vm.sh setup --with-manager
+
+# Apply the setup. Pacman retains its normal confirmation prompt.
+./qemu-vm.sh setup --with-manager --execute
+```
+
+The package transaction is:
+
+```bash
+sudo pacman -Syu --needed -- \
+  qemu-desktop libvirt virt-install virt-viewer edk2-ovmf \
+  virt-firmware swtpm dnsmasq nftables virt-manager
+```
+
+`virt-manager` is included only with `--with-manager`. `--needed` avoids
+reinstalling packages already at the current version. `-Syu` also upgrades the
+host, keeping Arch's packages consistent during dependency installation.
+
+Setup detects an active libvirt daemon mode first, then an enabled mode.
+Existing monolithic installations use `libvirtd`. Fresh installations use
+modular QEMU, network, and storage services and their supporting sockets.
+Enabling the driver services also makes VM/network autostart work after a host
+reboot. The default network's existing configuration is retained; setup defines
+the packaged network only when absent and enables its startup. This follows
+[libvirt's daemon and autostart guidance](https://libvirt.org/daemons.html).
+
+The script loads `kvm_amd` or `kvm_intel` if `/dev/kvm` is absent. A kernel
+without KVM support or disabled firmware virtualization produces a clear error.
+A host
+kernel upgrade may require a reboot before modules match the running kernel.
+
+## Create an Arch Linux guest
+
+Replace the ISO path with a file that exists on your machine:
+
+```bash
+./qemu-vm.sh create \
+  --name ArchLab \
+  --iso "$HOME/Downloads/archlinux-x86_64.iso" \
+  --os-variant archlinux \
+  --memory 4096 \
+  --vcpus 4 \
+  --disk-size 80
+```
+
+Review the preview, then repeat with `--execute` to create and start it:
+
+```bash
+./qemu-vm.sh create \
+  --name ArchLab \
+  --iso "$HOME/Downloads/archlinux-x86_64.iso" \
+  --os-variant archlinux \
+  --memory 4096 \
+  --vcpus 4 \
+  --disk-size 80 \
+  --execute
+
+virt-viewer --connect qemu:///system ArchLab
+```
+
+`virt-viewer` opens the installer display. Complete the operating-system
+installation there. On Hyprland, the viewer's authorization prompt needs a
+running desktop polkit authentication agent. `virt-manager` can manage the same
+VMs through its **QEMU/KVM system** connection.
+
+For dependency setup and guest creation in one invocation, add `--setup` to
+`create`. Setup runs only when requested; subsequent guests can reuse the host
+configuration. The installation ISO remains attached until you eject it.
+
+To prepare a VM without starting it, add `--no-start`. To start it at future
+host boots, add `--autostart`.
+
+## Create a Windows 11 guest
+
+```bash
+./qemu-vm.sh create \
+  --name Windows11 \
+  --guest windows \
+  --iso "$HOME/Downloads/Windows11.iso" \
+  --memory 8192 \
+  --vcpus 4 \
+  --disk-size 128 \
+  --no-start
+```
+
+Add `--execute` after reviewing the plan. The Windows preset enables TPM 2.0
+and Secure Boot, selects the `win11` OS definition, and uses a SATA disk and
+e1000e network interface. Explicit options override these defaults.
+
+For VirtIO storage and networking, obtain a trusted VirtIO driver ISO, then use:
+
+```bash
+./qemu-vm.sh create \
+  --name WindowsVirtIO \
+  --guest windows \
+  --iso "$HOME/Downloads/Windows11.iso" \
+  --driver-iso "$HOME/Downloads/virtio-win.iso" \
+  --disk-bus virtio \
+  --nic-model virtio \
+  --no-start \
+  --execute
+```
+
+Load the appropriate Windows storage driver from the second CD-ROM during
+installation, then install its networking and other guest drivers.
+
+## Main parameters and Hyper-V equivalents
+
+RAM is in MiB; disk capacity is in GiB. Each VM has a new sparse qcow2 disk.
+
+| Hyper-V concept | Script option / Linux behavior |
+| --- | --- |
+| VM name | `--name NAME` |
+| Installation ISO | `--iso PATH` |
+| Additional driver media | `--driver-iso PATH` |
+| Processor count | `--vcpus N`; one socket with N cores |
+| CPU model | `--cpu host-passthrough` or `host-model` |
+| CPU scheduling weight | `--cpu-shares N`; relative to other guests |
+| CPU maximum | `--cpu-limit PERCENT`; aggregate quota for allocated vCPUs |
+| Startup memory | `--memory MIB` |
+| Balloon memory ceiling | `--memory-max MIB` |
+| New virtual disk capacity | `--disk-size GIB` |
+| VM storage location | `--storage-dir /absolute/parent` |
+| Virtual switch | `--network NAME`, `bridge=BRIDGE`, or `none` |
+| Generation 2 firmware | UEFI with the q35 machine type |
+| Secure Boot | `--secure-boot off` or `on` |
+| Virtual TPM | `--tpm` / `--no-tpm`; software TPM 2.0 |
+| Preferred initial boot source | `--boot iso` or `disk` |
+| Leave powered off | `--no-start` |
+| Start at host boot | `--autostart` |
+| WhatIf | Default preview; `--execute` applies the operation |
+
+With four vCPUs, `--cpu-limit 50` allows about two logical CPUs' worth of total
+VM CPU time, including emulator work. It does not mean 50% of the entire host.
+No quota is imposed unless you supply the option. CPU shares express priority
+during contention; they are not percentages. Valid weight ranges depend on
+cgroups v1/v2, and the script detects the host's range. See
+[libvirt CPU tuning](https://libvirt.org/formatdomain.html#cpu-tuning).
+
+RAM defaults to a fixed setting. A larger `--memory-max` enables a VirtIO
+balloon with separate initial/current and maximum memory values. This requires
+guest balloon support and manual or external policy management. It does not
+implement Hyper-V's automatic Dynamic Memory algorithm or minimum/buffer
+settings. For a suitable running guest, an administrator can change the target:
+
+```bash
+sudo virsh --connect qemu:///system setmem ArchLab 6144MiB --live --config
+```
+
+That example requires creating the VM with a memory ceiling of at least
+6144 MiB. Ballooning can reclaim guest memory; it does not add virtual DIMMs.
+
+UEFI boot entries can subsequently be changed by the guest firmware or OS.
+Ejecting the installation ISO after installation avoids booting it again.
+
+## Firmware and TPM
+
+Secure Boot defaults to off for Linux and on for the Windows preset. When it
+is off, libvirt chooses a non-Secure-Boot UEFI firmware through its metadata.
+
+The installed Arch OVMF package at development time advertised Secure Boot
+firmware with an empty variable template. For `on`, the script discovers a
+compatible x86-64 q35 firmware descriptor and uses `virt-fw-vars` to create a
+separate template with a Microsoft platform key, Microsoft KEK certificates,
+and Microsoft Windows/UEFI signing certificates, including the tool's legacy
+and newer certificate sets. The `--secure-boot` flag activates enforcement.
+Libvirt creates each VM's writable NVRAM from that template. See the
+[virt-firmware tool documentation](https://gitlab.com/kraxel/virt-firmware)
+and the [libvirt Secure Boot guide](https://libvirt.org/kbase/secureboot.html).
+
+This policy accepts bootloaders signed by the enrolled certificates. It has no
+separate Hyper-V Windows/Linux template selector. Use a signed guest bootloader
+or keep `--secure-boot off` for an unsigned installer. The template uses the
+revocation data supplied by the input template/tool; the script does not fetch
+a new DBX revocation list. Maintain guest firmware revocations through the
+normal guest administration process.
+
+TPM state is maintained by libvirt and `swtpm`. Back up the guest's disk, NVRAM,
+and TPM state together if using guest encryption tied to that TPM.
+
+## Storage and networking
+
+The default guest files are:
+
+```text
+/var/lib/libvirt/images/ArchLab/
+  disk.qcow2                 New sparse guest disk
+  install.iso                Copy of the requested installer, when supplied
+  drivers.iso                Optional driver media copy
+  secure-vars-template.fd    Secure Boot template, when enabled
+  domain.xml                 Initial definition for inspection
+```
+
+The ISO copies use reflinks when the filesystems support them; otherwise they
+use ordinary copies. Copies are compared with their sources before the guest
+is defined. Full comparisons read the ISO data. Staging media here lets QEMU
+read it without changing permissions on private home directories.
+
+Existing guest names and guest directories are rejected. The script creates
+missing storage ancestors with traversal permissions, and requires existing
+ancestors to be traversable by other users. It leaves existing permissions
+alone. ACL-only access is outside this check; use the default storage root or
+a suitable shared directory. Paths with commas or control characters are
+rejected; spaces, quotes, and backslashes are handled.
+
+`--network default` uses libvirt's active default network. Other network names
+must already be active. `--network bridge=br0` uses an existing Linux bridge;
+the script validates that it exists. `--network none` creates an offline VM.
+Setup enables the default NAT network even if a subsequent guest uses a
+different network mode.
+
+SPICE/VNC listeners bind to `127.0.0.1`. `--graphics none` provides a serial
+console endpoint; the installer and installed guest must themselves support
+serial output. It does not inject kernel arguments into an arbitrary ISO.
+
+## Eject media, start, and inspect
+
+After installation, shut down the guest normally. Then:
+
+```bash
+./qemu-vm.sh eject-iso --name ArchLab
+./qemu-vm.sh eject-iso --name ArchLab --execute
+./qemu-vm.sh start --name ArchLab --execute
+./qemu-vm.sh info --name ArchLab
+```
+
+`eject-iso` changes the persistent first CD-ROM only, requires the guest to be
+off, and retains the media file. A second driver CD-ROM stays attached. For a
+VM created with driver media only, its first CD-ROM is the driver CD-ROM.
+
+These standard commands also work:
+
+```bash
+sudo virsh --connect qemu:///system list --all
+sudo virsh --connect qemu:///system shutdown ArchLab
+sudo virsh --connect qemu:///system dumpxml ArchLab
+sudo virsh --connect qemu:///system net-dhcp-leases default
+```
+
+## Validation and limitations
+
+The script asks `virt-install` to generate one persistent boot configuration
+with `--import --print-xml --dry-run`, then verifies the name, fresh UUID, KVM
+type, disks, ISO paths, Secure Boot template, and TPM settings before registering
+it. It verifies the saved libvirt definition again before starting the guest.
+The `--dry-run` matters because `--print-xml` alone can create storage. See the
+[virt-install manual](https://man.archlinux.org/man/virt-install.1).
+
+An error preserves partially created guest state for inspection. After a
+failed creation, inspect the error and retained files before deciding how to
+clean up or recover. `create` has no existing-VM reconfiguration or deletion
+mode. Manage existing hardware settings through libvirt/virt-manager.
+
+Checks performed during development: Bash syntax, ShellCheck, shfmt, and offline
+CLI safety fixtures. The fixture suite uses simulated privilege, libvirt,
+package, service, and firmware tools. It also creates and checks a real sparse
+qcow2 image in a temporary directory. Run it with:
+
+```bash
+cd ~/qemu-vm
+python3 -m unittest discover -s tests -v
+bash -n qemu-vm.sh
+shellcheck qemu-vm.sh
+shfmt -d -i 2 -ci qemu-vm.sh
+```
+
+`qemu-img` enables the disposable disk tests. Live dependency installation,
+libvirt/network activation, Secure Boot execution, and guest installation were
+not exercised during development. The available execution environment had no
+`/dev/kvm` and blocked access to the host system service bus.
