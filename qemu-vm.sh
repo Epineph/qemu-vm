@@ -51,6 +51,8 @@ TEMP_DIR=''
 CREATION_BEGUN=0
 ROOT=()
 VIRSH=()
+VIRT_INSTALL=(virt-install)
+VIRT_FW_VARS=(virt-fw-vars)
 INSTALL_ARGS=()
 CREATE_OPTIONS=()
 
@@ -64,9 +66,11 @@ Usage:
   qemu-vm.sh start --name NAME [--execute]
   qemu-vm.sh eject-iso --name NAME [--execute]
   qemu-vm.sh info --name NAME
+  qemu-vm.sh doctor
 
 Changes are PREVIEWED by default. Add --execute to apply them.
 info reads libvirt state and may request sudo authentication.
+doctor checks tools, KVM and libvirt without changing host or guest settings.
 
 Host setup:
   --setup                  Run host setup before creating the guest
@@ -115,6 +119,9 @@ Examples:
   # Preview host setup, then install dependencies and configure libvirt.
   ./qemu-vm.sh setup --with-manager
   ./qemu-vm.sh setup --with-manager --execute
+
+  # Diagnose dependencies, Python conflicts, KVM and libvirt connectivity.
+  ./qemu-vm.sh doctor
 
   # Preview an Arch guest using a local ISO and an 80 GiB disk.
   ./qemu-vm.sh create --name ArchLab \
@@ -188,6 +195,14 @@ function print_command() {
 }
 
 function cleanup() {
+  local status=$?
+  if ((status != 0 && CREATION_BEGUN)); then
+    printf 'Partial VM state was preserved. Inspect: %s\n' "$VM_DIR" >&2
+    printf 'Check the registered guest before retrying:\n' >&2
+    print_command "${VIRSH[@]}" dominfo "$NAME" >&2
+    printf 'create will refuse this directory; use a new name or inspect it\n' >&2
+    printf 'before manually recovering or removing any files.\n' >&2
+  fi
   if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
     rm -rf -- "$TEMP_DIR"
   fi
@@ -197,11 +212,6 @@ function on_error() {
   local status=$1 line=$2
   printf '\nOperation failed at script line %s (exit %s).\n' \
     "$line" "$status" >&2
-  if ((CREATION_BEGUN)); then
-    printf 'Partial VM state was preserved. Inspect: %s\n' "$VM_DIR" >&2
-    printf 'Check: sudo virsh --connect %s dominfo %s\n' \
-      "$VM_URI" "$NAME" >&2
-  fi
   exit "$status"
 }
 
@@ -219,6 +229,28 @@ function init_privileges() {
     ROOT=(sudo --)
   fi
   VIRSH=("${ROOT[@]}" virsh --connect "$VM_URI")
+}
+
+function select_python_tool() {
+  local -n selected=$1
+  local tool=$2 executable=''
+  selected=("$tool")
+  executable=$(command -v "$tool") || return 0
+  # Keep the same executable when sudo uses a different search path.
+  selected=("$executable")
+  # Arch's virt-install uses /usr/bin/env python3. A uv/venv Python, even in
+  # sudo's secure_path, cannot import Arch's gi/libvirt bindings. Isolate the
+  # packaged CLIs while leaving explicitly supplied wrappers on PATH usable.
+  if [[ "$(readlink -f -- "$executable")" == "/usr/bin/$tool" ]]; then
+    # ShellCheck does not follow assignments through Bash namerefs.
+    # shellcheck disable=SC2034
+    selected=(/usr/bin/python3 -I "/usr/bin/$tool")
+  fi
+}
+
+function init_python_tools() {
+  select_python_tool VIRT_INSTALL virt-install
+  select_python_tool VIRT_FW_VARS virt-fw-vars
 }
 
 function mutate() {
@@ -273,7 +305,7 @@ function parse_args() {
       usage
       exit 0
       ;;
-    setup | create | start | info | eject-iso)
+    setup | create | start | info | eject-iso | doctor)
       ACTION=$1
       shift
       ;;
@@ -375,8 +407,8 @@ function parse_args() {
   if ((WITH_MANAGER)) && [[ "$ACTION" != setup ]] && ! ((WITH_SETUP)); then
     die '--with-manager requires setup or create --setup.'
   fi
-  if [[ "$ACTION" == setup ]]; then
-    [[ -z "$NAME" ]] || die 'setup does not accept --name.'
+  if [[ "$ACTION" == setup || "$ACTION" == doctor ]]; then
+    [[ -z "$NAME" ]] || die "$ACTION does not accept --name."
   else
     [[ "$NAME" =~ ^[A-Za-z][A-Za-z0-9_.-]{0,63}$ ]] ||
       die '--name must start with a letter and use 1..64 letters/digits/_.-.'
@@ -621,6 +653,45 @@ function ensure_kvm() {
     die 'No /dev/kvm. Enable AMD-V/VT-x in firmware and check kernel modules.'
 }
 
+function doctor_host() {
+  local failed=0 tool=''
+  step 'Read-only host diagnostics'
+  printf '  Host: %s; libvirt connection: %s\n' "$(uname -srm)" "$VM_URI"
+  printf '  Shell Python: %s\n' "$(command -v python3 || true)"
+  printf '  Packaged virt-install command:\n'
+  print_command "${VIRT_INSTALL[@]}" --version
+  for tool in virsh virt-install qemu-img python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      printf 'Error: missing %s. Run setup --execute.\n' "$tool" >&2
+      failed=1
+    fi
+  done
+  if command -v virt-install >/dev/null 2>&1; then
+    if ! "${ROOT[@]}" "${VIRT_INSTALL[@]}" --version; then
+      printf 'Error: virt-install cannot run; check the Python error above.\n' >&2
+      failed=1
+    fi
+  fi
+  if [[ -c /dev/kvm ]]; then
+    printf '  KVM device: present\n'
+  else
+    printf 'Error: /dev/kvm is missing. Check AMD-V/VT-x, kernel modules,\n' >&2
+    printf 'and whether this shell has access to the host KVM device.\n' >&2
+    failed=1
+  fi
+  if command -v virsh >/dev/null 2>&1; then
+    if "${VIRSH[@]}" list --all; then
+      if ! "${VIRSH[@]}" net-list --all; then failed=1; fi
+    else
+      printf 'Error: cannot connect to system libvirt. Run setup --execute\n' >&2
+      printf 'on the host, then rerun doctor.\n' >&2
+      failed=1
+    fi
+  fi
+  ((failed == 0)) || die 'Host diagnostics found the problems listed above.'
+  printf 'Host diagnostics passed. Guest boot has not been tested.\n'
+}
+
 # ---------------------------------------------------------------------------
 # Domain generation: firmware metadata, argument arrays, XML verification
 # ---------------------------------------------------------------------------
@@ -690,7 +761,7 @@ function build_install_args() {
   media_options+=',device=cdrom,bus=sata,readonly=on'
   driver_options="path=$(suboption_path "$DRIVER_PATH")"
   driver_options+=',device=cdrom,bus=sata,readonly=on'
-  INSTALL_ARGS=(virt-install --connect "$VM_URI" --name "$NAME"
+  INSTALL_ARGS=("${VIRT_INSTALL[@]}" --connect "$VM_URI" --name "$NAME"
     --virt-type kvm --arch x86_64 --machine q35 --cpu "$CPU"
     --memory "$memory" --vcpus "$VCPUS,sockets=1,cores=$VCPUS,threads=1"
     --osinfo "$OS_VARIANT" --import --boot "$boot"
@@ -760,6 +831,37 @@ function check_connection() {
     die 'Cannot connect to system libvirt. Run setup --execute first.'
 }
 
+function check_creation_tools() {
+  local variants=''
+  require_command virt-install
+  require_command qemu-img
+  require_command python3
+  # create --setup may have installed these since the initial PATH lookup.
+  init_python_tools
+  if [[ -n "$ISO_URL" ]] || ((ARCH_LATEST)); then require_command curl; fi
+  if [[ -n "$ISO_SHA256" ]] || ((ARCH_LATEST)); then
+    require_command sha256sum
+  fi
+  step 'Check installer tools before creating guest files'
+  "${ROOT[@]}" "${VIRT_INSTALL[@]}" --version >/dev/null ||
+    die 'virt-install cannot run. Check its Python/dependency error above.'
+  variants=$("${ROOT[@]}" "${VIRT_INSTALL[@]}" --osinfo list) ||
+    die 'Cannot read the libosinfo database. Run setup --execute.'
+  # The CLI lists aliases on one line separated by commas and spaces.
+  variants=${variants//,/ }
+  variants=${variants//$'\n'/ }
+  if [[ "$OS_VARIANT" != generic && " $variants " != *" $OS_VARIANT "* ]]; then
+    printf 'List available OS definitions with:\n' >&2
+    print_command "${ROOT[@]}" "${VIRT_INSTALL[@]}" --osinfo list >&2
+    die "Unknown OS variant '$OS_VARIANT'."
+  fi
+  if [[ "$SECURE_BOOT" == on ]]; then
+    require_command virt-fw-vars
+    "${ROOT[@]}" "${VIRT_FW_VARS[@]}" --help >/dev/null ||
+      die 'virt-fw-vars cannot run. Check its Python/dependency error above.'
+  fi
+}
+
 function verify_definition() {
   local xml_path=$1
   python3 - "$xml_path" "$NAME" "$DISK_PATH" "$MEDIA_PATH" \
@@ -818,13 +920,9 @@ function create_vm() {
 
   if ((! EXECUTE)); then
     if [[ "$SECURE_BOOT" == on ]]; then
-      if command -v python3 >/dev/null &&
-        [[ -d /usr/share/qemu/firmware ]]; then
-        discover_secure_firmware
-      else
-        FIRMWARE_CODE='<discovered-secure-OVMF-code>'
-        FIRMWARE_VARS='<discovered-OVMF-vars-template>'
-      fi
+      # Previews must also work before setup has installed usable firmware.
+      FIRMWARE_CODE='<discovered-secure-OVMF-code>'
+      FIRMWARE_VARS='<discovered-OVMF-vars-template>'
     fi
     printf '\n  Check KVM, libvirt, firmware, network and unique name.\n'
     ensure_storage_parent
@@ -839,14 +937,7 @@ function create_vm() {
     return
   fi
 
-  require_command virt-install
-  require_command qemu-img
-  require_command python3
-  if [[ -n "$ISO_URL" ]] || ((ARCH_LATEST)); then require_command curl; fi
-  if [[ -n "$ISO_SHA256" ]] || ((ARCH_LATEST)); then
-    require_command sha256sum
-  fi
-  [[ "$SECURE_BOOT" != on ]] || require_command virt-fw-vars
+  check_creation_tools
   check_connection
   ensure_kvm
   names=$("${VIRSH[@]}" list --all --name)
@@ -907,7 +998,7 @@ function preview_storage() {
       -- "$DRIVER_ISO" "$DRIVER_PATH"
   fi
   if [[ "$SECURE_BOOT" == on ]]; then
-    print_command "${ROOT[@]}" virt-fw-vars --input "$FIRMWARE_VARS" \
+    print_command "${ROOT[@]}" "${VIRT_FW_VARS[@]}" --input "$FIRMWARE_VARS" \
       --output "$VM_DIR/secure-vars-template.fd" --enroll-microsoft \
       --microsoft-db all --microsoft-kek all --secure-boot
   fi
@@ -935,7 +1026,7 @@ function prepare_storage() {
   fi
   if [[ "$SECURE_BOOT" == on ]]; then
     step 'Enroll guest Secure Boot certificates in a private NVRAM template'
-    mutate virt-fw-vars --input "$FIRMWARE_VARS" \
+    mutate "${VIRT_FW_VARS[@]}" --input "$FIRMWARE_VARS" \
       --output "$VM_DIR/secure-vars-template.fd" --enroll-microsoft \
       --microsoft-db all --microsoft-kek all --secure-boot
     mutate chmod 0644 -- "$VM_DIR/secure-vars-template.fd"
@@ -1086,7 +1177,8 @@ function main() {
   check_host
   [[ "$ACTION" != create ]] || validate_create
   init_privileges
-  if ((! EXECUTE)) && [[ "$ACTION" != info ]]; then
+  init_python_tools
+  if ((! EXECUTE)) && [[ "$ACTION" != info && "$ACTION" != doctor ]]; then
     printf 'PREVIEW ONLY. Add --execute to apply this plan.\n'
   fi
   case "$ACTION" in
@@ -1103,6 +1195,7 @@ function main() {
       check_connection
       show_info
       ;;
+    doctor) doctor_host ;;
     eject-iso) eject_iso ;;
   esac
 }

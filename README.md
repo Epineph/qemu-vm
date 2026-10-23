@@ -6,7 +6,7 @@ from Bash or invoke the executable from Zsh.
 The host must run x86-64 Arch Linux with AMD-V or Intel VT-x available.
 
 Every command that changes state previews its operation until `--execute` is
-supplied. `info` queries the system libvirt connection and can request sudo
+supplied. `info` and `doctor` query system libvirt and can request sudo
 authentication. Run the script as your ordinary account; it uses sudo for the
 operations that require root. A root shell also works.
 
@@ -51,6 +51,18 @@ The script loads `kvm_amd` or `kvm_intel` if `/dev/kvm` is absent. A kernel
 without KVM support or disabled firmware virtualization produces a clear error.
 A host kernel upgrade may require a reboot before modules match the running
 kernel.
+
+Check tools, KVM device presence and libvirt state:
+
+```bash
+./qemu-vm.sh doctor
+```
+
+This reports executable availability, the selected Python/installer command,
+whether the installer runs, KVM device presence, libvirt connectivity, and the
+defined guests and networks. It returns a failure status when a required check
+fails. Firmware execution, network connectivity inside a guest, and VM boot
+still require testing with a real guest.
 
 ## Fetch the newest Arch ISO automatically
 
@@ -314,6 +326,11 @@ use ordinary copies. Copies are compared with their sources before the guest
 is defined. Full comparisons read the ISO data. Staging media here lets QEMU
 read it without changing permissions on private home directories.
 
+Before creating the guest directory, the script checks that `virt-install`
+runs, validates the OS definition against libosinfo (including aliases), and
+checks the Secure Boot tool when requested. Windows previews use symbolic
+firmware paths so that `create --setup` can be previewed before OVMF is installed.
+
 Existing guest names and guest directories are rejected. The script creates
 missing storage ancestors with traversal permissions, and requires existing
 ancestors to be traversable by other users. It leaves existing permissions
@@ -355,6 +372,43 @@ sudo virsh --connect qemu:///system dumpxml ArchLab
 sudo virsh --connect qemu:///system net-dhcp-leases default
 ```
 
+## Troubleshooting failed creation
+
+Run `./qemu-vm.sh doctor` first. The revision fixes a reproduced failure where
+Arch's `/usr/bin/virt-install` selected a uv-managed Python from `PATH`, then
+failed with `ModuleNotFoundError: No module named 'gi'`. The same problem can
+occur under sudo when its configured path includes that Python.
+
+For the packaged `/usr/bin/virt-install` and `/usr/bin/virt-fw-vars`, the script
+now explicitly uses `/usr/bin/python3 -I`. This keeps their imports with Arch's
+installed dependencies and ignores user Python environment overrides. Custom
+tool wrappers on `PATH` retain their own invocation. To test the packaged
+installer independently:
+
+```bash
+/usr/bin/python3 -I /usr/bin/virt-install --version
+/usr/bin/python3 -I /usr/bin/virt-install --osinfo list
+```
+
+If creation has already failed, inspect its guest registration and retained
+files before retrying. For example:
+
+```bash
+./qemu-vm.sh info --name AlpineLab
+sudo ls -lh -- /var/lib/libvirt/images/AlpineLab
+```
+
+An absent libvirt guest can coexist with a retained ISO and disk if creation
+failed before registration. A registered guest can also remain after a later
+failure. `create` deliberately refuses both existing names and existing guest
+directories. It does not resume or delete partial state. Keep those files for
+manual recovery, or choose a new name and directory for a separate attempt.
+
+If `/dev/kvm` is missing, check virtualization support, the running kernel, and
+device access on the actual host. Containers and restricted environments can
+hide KVM even when the host supports it. `doctor` reports this without trying
+to load modules or change the environment.
+
 ## Validation and limitations
 
 The script asks `virt-install` to generate one persistent boot configuration
@@ -364,15 +418,23 @@ it. It verifies the saved libvirt definition again before starting the guest.
 The `--dry-run` matters because `--print-xml` alone can create storage. See the
 [virt-install manual](https://man.archlinux.org/man/virt-install.1).
 
-An error preserves partially created guest state for inspection. After a
-failed creation, inspect the error and retained files before deciding how to
-clean up or recover. `create` has no existing-VM reconfiguration or deletion
-mode. Manage existing hardware settings through libvirt/virt-manager.
+An error preserves partially created guest state for inspection and reports
+the retained directory, including failures from explicit validation checks.
+After a failed creation, inspect the error and retained files before deciding
+how to clean up or recover. `create` has no existing-VM reconfiguration or
+deletion mode. Manage existing hardware settings through libvirt/virt-manager.
 
 Checks performed during development: Bash syntax, ShellCheck, shfmt, and offline
 CLI safety fixtures. The fixture suite uses simulated privilege, libvirt,
 package, service, and firmware tools. It also creates and checks a real sparse
-qcow2 image in a temporary directory. Run it with:
+qcow2 image in a temporary directory. Optional installed-tool checks invoke the
+real packaged installer with a poisoned user Python environment and generate
+Linux/Windows XML through libvirt's in-memory test driver. They check the real
+argument parser and, when available, the XML schema, without host services or
+real guests. The synthetic capability URI is an internal upstream test hook;
+these checks establish compatibility with the installed tools, not host boot
+support. Tests skip those optional checks if dependencies are unavailable.
+Run them with:
 
 ```bash
 cd ~/my_repos/qemu-vm

@@ -33,6 +33,9 @@ source "$1"
 shift
 function ensure_kvm() { :; }
 function check_host() { :; }
+if [[ "${QVM_MISSING_FIRMWARE:-}" == 1 ]]; then
+  function discover_secure_firmware() { die 'Fixture firmware is absent.'; }
+fi
 main "$@"
 '''
 
@@ -137,8 +140,19 @@ elif tool == 'systemctl':
     configured = os.environ.get('QVM_' + args[0].upper().replace('-', '_'), '')
     raise SystemExit(0 if args[-1] in configured.split(',') else 1)
 elif tool == 'virt-fw-vars':
+  if args == ['--help']:
+    print('fixture firmware help')
+    raise SystemExit(0)
   Path(argument('--output')).write_bytes(b'fixture NVRAM')
 elif tool == 'virt-install':
+  if args == ['--version']:
+    print('5.1.0')
+    raise SystemExit(0)
+  if args == ['--osinfo', 'list']:
+    if os.environ.get('QVM_FAIL_OSINFO'):
+      raise SystemExit('Simulated libosinfo failure')
+    print('archlinux\nwin11\nalpinelinux3.24\nubuntu24.04, ubuntunoble')
+    raise SystemExit(0)
   root = ET.Element('domain', type='kvm')
   ET.SubElement(root, 'name').text = argument('--name')
   ET.SubElement(root, 'uuid').text = str(uuid.uuid4())
@@ -265,6 +279,10 @@ class CliSafetyTests(unittest.TestCase):
                ] if self.log.exists() else []
     return [record for record in records if tool in (None, record['tool'])]
 
+  def installer_arguments(self):
+    return next(record['args'] for record in self.commands('virt-install')
+                if '--print-xml' in record['args'])
+
   def create_download(self, *arguments, **environment):
     if not REAL_QEMU_IMG:
       self.skipTest('qemu-img is required for disposable disk checks')
@@ -314,6 +332,14 @@ class CliSafetyTests(unittest.TestCase):
     result = self.create('--setup')
     self.assert_success(result)
     self.assertIn('Plan for LabVM', result.stdout)
+    self.assertEqual(self.commands(), [])
+    self.assertFalse(self.storage.exists())
+
+  def test_windows_preview_succeeds_before_firmware_is_installed(self):
+    result = self.create('--guest', 'windows', '--setup',
+                         QVM_MISSING_FIRMWARE='1')
+    self.assert_success(result)
+    self.assertIn('Secure Boot: on', result.stdout)
     self.assertEqual(self.commands(), [])
     self.assertFalse(self.storage.exists())
 
@@ -397,6 +423,8 @@ class CliSafetyTests(unittest.TestCase):
     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
     self.assertEqual(self.iso.read_bytes(), original)
     self.assertEqual(self.commands('curl'), [])
+    self.assertIn('Partial VM state was preserved', result.stderr)
+    self.assertIn(str(self.storage / 'LabVM'), result.stderr)
     self.assert_no_disk_or_definition()
 
   def test_latest_arch_selects_pinned_release_and_automatic_os_variant(self):
@@ -412,14 +440,14 @@ class CliSafetyTests(unittest.TestCase):
     self.assert_https_download(calls[0], ARCH_RELEASES_URL)
     self.assert_https_download(calls[1], ARCH_ISO_URL)
     self.assertNotIn('/latest/', calls[1]['args'][-1])
-    installer = self.commands('virt-install')[0]['args']
+    installer = self.installer_arguments()
     self.assertEqual(installer[installer.index('--osinfo') + 1], 'archlinux')
 
   def test_latest_arch_preserves_explicit_os_variant(self):
     result = self.create_download('--arch-latest', '--os-variant', 'generic',
                                   '--no-start', '--execute')
     self.assert_success(result)
-    installer = self.commands('virt-install')[0]['args']
+    installer = self.installer_arguments()
     self.assertEqual(installer[installer.index('--osinfo') + 1], 'generic')
 
   def test_latest_arch_rejects_invalid_metadata_before_downloading_iso(self):
@@ -519,6 +547,8 @@ class CliSafetyTests(unittest.TestCase):
       ('create', '--name', 'Guest', '--execute', '--dry-run'),
       ('start', '--name', 'Guest', '--disk-size', '80'),
       ('setup', '--name', 'Guest'),
+      ('doctor', '--name', 'Guest'),
+      ('doctor', '--setup'),
       ('info', '--name', 'Guest', '--with-manager'),
     ]
     for arguments in cases:
@@ -556,6 +586,39 @@ class CliSafetyTests(unittest.TestCase):
     self.assert_failure(result, 'absent or inactive')
     self.assertFalse(self.storage.exists())
 
+  def test_broken_installer_is_rejected_before_download_or_storage_writes(self):
+    result = self.create_download('--arch-latest', '--execute',
+                                  QVM_FAIL_TOOL='virt-install')
+    self.assert_failure(result, 'virt-install')
+    self.assertFalse(self.storage.exists())
+    self.assertEqual(self.commands('curl'), [])
+    self.assert_no_disk_or_definition()
+
+  def test_broken_osinfo_is_rejected_before_storage_writes(self):
+    result = self.create('--execute', QVM_FAIL_OSINFO='1')
+    self.assert_failure(result, 'libosinfo')
+    self.assertFalse(self.storage.exists())
+    self.assert_no_disk_or_definition()
+
+  def test_unknown_os_variant_is_rejected_before_storage_writes(self):
+    result = self.create('--os-variant', 'imaginary-vm-99', '--execute')
+    self.assert_failure(result, 'imaginary-vm-99')
+    self.assertFalse(self.storage.exists())
+    self.assert_no_disk_or_definition()
+
+  def test_os_variant_alias_is_accepted(self):
+    result = self.create('--os-variant', 'ubuntunoble', '--no-start', '--execute')
+    self.assert_success(result)
+    arguments = self.installer_arguments()
+    self.assertEqual(arguments[arguments.index('--osinfo') + 1], 'ubuntunoble')
+
+  def test_broken_firmware_tool_is_rejected_before_storage_writes(self):
+    result = self.create('--guest', 'windows', '--execute',
+                         QVM_FAIL_TOOL='virt-fw-vars')
+    self.assert_failure(result, 'virt-fw-vars')
+    self.assertFalse(self.storage.exists())
+    self.assert_no_disk_or_definition()
+
   def test_private_storage_ancestor_is_not_chmodded(self):
     self.storage.mkdir(mode=0o700)
     result = self.create('--execute')
@@ -588,7 +651,7 @@ class CliSafetyTests(unittest.TestCase):
     self.assertEqual(root.find('devices/disk/source').get('file'),
                      str(guest_dir / 'disk.qcow2'))
     self.assertFalse(any(r['args'][2] == 'start' for r in self.commands('virsh')))
-    installer = self.commands('virt-install')[0]['args']
+    installer = self.installer_arguments()
     self.assertIn('--print-xml', installer)
     self.assertIn('--dry-run', installer)
 
@@ -600,14 +663,15 @@ class CliSafetyTests(unittest.TestCase):
     self.assert_success(result)
     self.assertEqual((self.storage / 'LabVM' / 'drivers.iso').read_bytes(),
                      drivers.read_bytes())
-    firmware = self.commands('virt-fw-vars')[0]['args']
+    firmware = next(record['args'] for record in self.commands('virt-fw-vars')
+                    if '--output' in record['args'])
     for option in ('--enroll-microsoft', '--microsoft-db', '--microsoft-kek',
                    '--secure-boot'):
       self.assertIn(option, firmware)
     root = ET.parse(self.state / 'LabVM.xml').getroot()
     self.assertEqual(root.find('os/loader').get('secure'), 'yes')
     self.assertEqual(root.find('devices/tpm/backend').get('version'), '2.0')
-    installer = self.commands('virt-install')[0]['args']
+    installer = self.installer_arguments()
     self.assertIn('network=default,model=e1000e', installer)
 
   def test_cpu_budget_and_balloon_arguments(self):
@@ -615,7 +679,7 @@ class CliSafetyTests(unittest.TestCase):
                          '--memory', '2048', '--memory-max', '8192',
                          '--no-start', '--execute')
     self.assert_success(result)
-    installer = self.commands('virt-install')[0]['args']
+    installer = self.installer_arguments()
     self.assertIn('global_period=100000,global_quota=200000', installer)
     self.assertIn('2048,maxmemory=8192', installer)
     self.assertEqual(installer[installer.index('--memballoon') + 1], 'virtio')
@@ -674,6 +738,18 @@ class CliSafetyTests(unittest.TestCase):
     self.assert_failure(result, 'Both libvirt daemon modes')
     self.assertFalse(any(r['args'][0] == 'enable'
                          for r in self.commands('systemctl')))
+
+  def test_doctor_reports_failures_and_only_runs_read_queries(self):
+    result = self.run_cli('doctor', '--execute',
+                          QVM_FAIL_TOOL='virt-install')
+    self.assert_failure(result, 'virt-install cannot run')
+    self.assertIn('Read-only host diagnostics', result.stdout)
+    self.assertNotIn('PREVIEW ONLY', result.stdout)
+    self.assertFalse(self.storage.exists())
+    self.assertEqual({record['tool'] for record in self.commands()} -
+                     {'sudo', 'virt-install', 'virsh'}, set())
+    self.assertEqual([record['args'][2] for record in self.commands('virsh')],
+                     ['list', 'net-list'])
 
   def seed_media_guest(self):
     root = ET.Element('domain')
